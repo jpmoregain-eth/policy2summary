@@ -17,7 +17,7 @@ export default async function handler(req, res) {
       agnes: {
         apiKey: process.env.AGNES_API_KEY || '',
         baseUrl: 'https://apihub.agnes-ai.com/v1',
-        model: isExecutive ? 'agnes-1.5-pro' : 'agnes-1.5-flash'
+        model: isExecutive ? 'agnes-2.0-flash' : 'agnes-1.5-flash'
       },
       kimi: {
         apiKey: process.env.KIMI_API_KEY || '',

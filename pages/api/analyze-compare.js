@@ -86,7 +86,7 @@ Return ONLY a JSON object with this exact structure:
         'Authorization': `Bearer ${API_KEY}`
       },
       body: JSON.stringify({
-        model: 'agnes-1.5-pro',
+        model: 'agnes-2.0-flash',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: `Compare these ${documents.length} insurance policies:\n${combinedText}` }
