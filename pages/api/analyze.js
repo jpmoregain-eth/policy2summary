@@ -1,6 +1,8 @@
-import { standardPrompt, executivePrompt, buildUserMessage } from '../../lib/prompts';
+import { standardPrompt, buildUserMessage } from '../../lib/prompts';
 import { condensePolicyText } from '../../lib/policy-text';
 import { parseModelJson } from '../../lib/json-response';
+import { FREE } from '../../lib/tiers';
+import { rateLimit, clientKey, isShared } from '../../lib/store';
 
 // Vercel Pro allows 60s; the client aborts at 55s.
 export const config = { maxDuration: 60 };
@@ -16,6 +18,13 @@ export default async function handler(req, res) {
   try {
     const { text, mode = 'standard', fileName = null } = req.body;
 
+    if (mode !== 'standard') {
+      return res.status(402).json({
+        error: 'Full reports are a paid feature. Use /api/report after checkout.',
+        upgrade_required: true
+      });
+    }
+
     if (!text || text.length < 50) {
       return res.status(400).json({ error: 'Insufficient text extracted. Please upload a clearer document.' });
     }
@@ -28,7 +37,21 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'AI service not configured' });
     }
 
-    const systemPrompt = mode === 'executive' ? executivePrompt() : standardPrompt();
+    // The free tier is the only unauthenticated path that spends money, so it
+    // is the one that needs a ceiling. Keyed on IP, reset daily.
+    const limit = await rateLimit(`free:${clientKey(req)}`, FREE.dailyRuns, 24 * 60 * 60);
+    if (!limit.allowed) {
+      return res.status(429).json({
+        error: `That is ${FREE.dailyRuns} free summaries today. Come back tomorrow, or get a full report covering every policy at once.`,
+        limit_reached: true,
+        daily_limit: FREE.dailyRuns
+      });
+    }
+    if (!isShared()) {
+      console.warn('Rate limiting is per-instance: set KV_REST_API_URL/TOKEN to enforce it across invocations.');
+    }
+
+    const systemPrompt = standardPrompt();
     const condensed = condensePolicyText(text, CONTEXT_BUDGET);
 
     const response = await fetch('https://apihub.agnes-ai.com/v1/chat/completions', {
@@ -51,6 +74,7 @@ export default async function handler(req, res) {
     if (!response.ok) {
       const errorText = await response.text();
       console.error('Agnes API error:', errorText);
+      await limit.refund();
       return res.status(502).json({ error: 'AI analysis service temporarily unavailable. Please try again.' });
     }
 
@@ -60,9 +84,9 @@ export default async function handler(req, res) {
 
     if (!parsed.ok) {
       console.error('JSON parse failed:', parsed.reason, 'Sample:', parsed.sample);
+      await limit.refund();
       return res.status(500).json({
-        error: 'AI response format error. Please try again with a clearer document.',
-        raw: parsed.sample
+        error: 'AI response format error. Please try again with a clearer document.'
       });
     }
 

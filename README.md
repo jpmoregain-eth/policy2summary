@@ -1,8 +1,11 @@
 # Policy2Summary
 
-**AI Insurance Document Reader** — Upload your insurance certificate, get an instant plain-English summary.
+**AI Insurance Document Reader** — Upload your insurance policies, get an instant plain-English summary.
 
-No signup. No data stored. Free tool.
+No signup. No data stored.
+
+- **Free** — a plain-English summary of each policy, on screen.
+- **Full report, S$4.90** — upload up to 5 policies, get one combined PDF that reads the whole wording. One price whether you upload one policy or five.
 
 ## What It Does
 
@@ -28,13 +31,20 @@ No signup. No data stored. Free tool.
 ```bash
 npm install
 cat > .env.local <<'ENV'
-AGNES_API_KEY=your_key_here
-# Optional:
-# KIMI_API_KEY=your_key_here          # fallback provider
-# ANTHROPIC_API_KEY=your_key_here     # enables /api/analyze-claude (Haiku 4.5)
+AGNES_API_KEY=your_key_here          # free-tier summaries
+# Paid reports:
+# ANTHROPIC_API_KEY=your_key_here    # Claude Haiku 4.5
+# STRIPE_SECRET_KEY=sk_test_...      # Stripe Checkout
+# NEXT_PUBLIC_SITE_URL=http://localhost:3000
+# Shared state (rate limits + payment redemption) — required in production:
+# KV_REST_API_URL=...
+# KV_REST_API_TOKEN=...
 ENV
 npm run dev
 ```
+
+Without the Stripe and Anthropic keys the app still runs: free summaries work
+and the paid routes return a clear "not enabled" response.
 
 Open http://localhost:3000
 
@@ -43,7 +53,11 @@ Open http://localhost:3000
 Deploy to Vercel:
 1. Push repo to GitHub
 2. Import to Vercel
-3. Add `AGNES_API_KEY` environment variable in Vercel dashboard
+3. Add the environment variables above in the Vercel dashboard
+
+The free-tier rate limit needs `KV_REST_API_URL` / `KV_REST_API_TOKEN`
+(Upstash Redis, free tier is enough). Serverless instances do not share memory,
+so without them the daily limit does not actually hold.
 
 ## How The Analysis Works
 

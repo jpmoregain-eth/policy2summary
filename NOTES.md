@@ -6,13 +6,14 @@
 
 ## What This Is
 
-AI-powered insurance document summarizer.
-- **Quick summary** via `/api/analyze` (agnes-2.0-flash, 55s timeout)
-- **Executive PDF report** via `/api/analyze-fallback` (agnes-2.0-flash, 25s per attempt, 4 retries with 10s backoff)
-- **Multi-policy comparison** via `/api/analyze-compare` (analyzes 2+ docs together, generates consolidated comparison PDF)
-- **Claude Haiku 4.5 route** via `/api/analyze-claude` — tier-aware, handles all three modes, inert unless `ANTHROPIC_API_KEY` is set
+AI-powered insurance document summarizer, with one paid product.
 
-Note: nothing is actually gated behind payment yet. Every feature is free to every visitor.
+- **Free**: per-policy summary on screen via `/api/analyze` (agnes-2.0-flash). 3 per IP per day. No PDF.
+- **Paid — the report**: `S$4.90` one-off. Upload 1-5 policies, pay, get one combined PDF. Runs on `claude-haiku-4-5` via `/api/report`.
+
+**The product is the report.** Priced per report, not per policy — one price whether
+you upload one policy or five. Charging per policy would tax the exact behaviour
+that makes this useful: putting a household's whole set in front of the model at once.
 
 Domain: **policy2summary.com**
 Repo: **jpmoregain-eth/policy2summary**
@@ -31,26 +32,39 @@ Repo: **jpmoregain-eth/policy2summary**
 - Supports up to 5 documents simultaneously
 
 ### API Routes
-| Route | Purpose | Model | Timeout |
-|-------|---------|-------|---------|
-| `/api/analyze` | Quick summary | agnes-2.0-flash | 55s |
-| `/api/analyze-fallback` | Executive PDF + Kimi fallback | agnes-2.0-flash / kimi-k2.6 | 25s per attempt |
-| `/api/analyze-compare` | Multi-policy comparison | agnes-2.0-flash | 55s |
-| `/api/analyze-claude` | Tier-aware analysis (all modes) | claude-haiku-4-5 | 60s |
+| Route | Purpose | Model | Paid? |
+|-------|---------|-------|-------|
+| `/api/analyze` | Free per-policy summary, rate limited | agnes-2.0-flash | No |
+| `/api/analyze-fallback` | Free summary, alternate provider | agnes-1.5-flash / kimi-k2.6 | No |
+| `/api/checkout` | Creates a Stripe Checkout session | — | — |
+| `/api/report` | The paid combined report | claude-haiku-4-5 | **Yes** |
+| `/api/analyze-compare` | Retired stub, returns 402 | — | — |
 
-All four routes now export `config = { maxDuration: 60 }` — without it Vercel
-applied its default limit regardless of the Pro plan.
+Every route exports `config = { maxDuration: 60 }` — without it Vercel applied
+its default limit regardless of the Pro plan.
+
+### The paywall
+
+Executive and comparison analysis are the paid product, so **every free route
+returns 402 for those modes**. `/api/analyze-claude` was deleted outright: it
+read the tier from the request body, which meant the caller could simply declare
+itself paid. Entitlement now comes from Stripe and nowhere else.
 
 ### Environment Variables (Vercel)
 ```
-AGNES_API_KEY=<key>          # Required for the Agnes routes
+AGNES_API_KEY=<key>          # Free tier summaries
 KIMI_API_KEY=<key>           # Fallback provider (optional)
-ANTHROPIC_API_KEY=<key>      # Enables /api/analyze-claude (optional)
 
-# Optional tuning — how many characters of the document each mode sends
-ANALYZE_CONTEXT_CHARS=30000
-EXECUTIVE_CONTEXT_CHARS=45000
-COMPARE_CONTEXT_CHARS=60000
+ANTHROPIC_API_KEY=<key>      # Paid reports only — spent only when revenue arrives
+STRIPE_SECRET_KEY=<key>      # Enables /api/checkout and /api/report
+NEXT_PUBLIC_SITE_URL=https://policy2summary.com   # Stripe return URLs
+
+# Shared state for rate limiting and payment redemption. WITHOUT THESE THE
+# FREE-TIER LIMIT DOES NOT HOLD — each Vercel instance counts separately.
+KV_REST_API_URL=<upstash url>
+KV_REST_API_TOKEN=<upstash token>
+
+ANALYZE_CONTEXT_CHARS=30000  # optional
 ```
 - **NEVER hardcode API keys in source** — GitHub push protection will block commits containing keys
 - Kimi endpoint: `https://api.moonshot.ai/v1` (NOT apihub.agnes-ai.com)
@@ -257,11 +271,9 @@ try {
 
 | Feature | Model | Why |
 |---------|-------|-----|
-| Quick summary | `agnes-2.0-flash` | Fast, cheap, good enough for basic extraction |
-| Executive PDF | `agnes-2.0-flash` | Deeper prompt, same model |
-| Comparison | `agnes-2.0-flash` | Multi-doc reasoning |
+| Free summary | `agnes-2.0-flash` | Already paid for. Keeps the Anthropic credit for paying customers |
 | Fallback | `kimi-k2.6` (moonshot) | Backup when Agnes is rate-limited |
-| Tiered route | `claude-haiku-4-5` | 200K context (reads whole policies), prompt caching, stable JSON |
+| Paid report | `claude-haiku-4-5` | 200K context reads a whole policy wording; ~6 cents per report |
 
 ---
 
@@ -273,11 +285,13 @@ try {
 | `lib/prompts.js` | **Every analysis prompt lives here.** Single source of truth |
 | `lib/policy-text.js` | Signal-weighted condensation — keeps exclusions, drops boilerplate |
 | `lib/json-response.js` | Tolerant JSON parsing, including repair of truncated responses |
-| `lib/tiers.js` | Free / Pro tier definitions |
+| `lib/tiers.js` | Free vs paid-report definitions, including the price |
+| `lib/store.js` | Shared state over Upstash REST — rate limits and payment redemption |
 | `pages/api/analyze.js` | Quick summary endpoint |
 | `pages/api/analyze-fallback.js` | Executive endpoint with provider fallback |
-| `pages/api/analyze-compare.js` | Multi-policy comparison endpoint |
-| `pages/api/analyze-claude.js` | Claude Haiku 4.5, tier-aware |
+| `pages/api/analyze-compare.js` | Retired stub (402) |
+| `pages/api/checkout.js` | Stripe Checkout session |
+| `pages/api/report.js` | The paid report — verifies payment, then generates |
 | `public/googlef0b1253b37cd8c20.html` | Google Search Console verification |
 
 ---
@@ -359,3 +373,44 @@ text and let the server truncate at 8,000. Both are gone.
 ## Contact
 - **Email:** thejpmoregainproject@gmail.com
 - **Added to footer:** 2026-05-20
+
+
+---
+
+## The Payment Flow
+
+No accounts, no database. The document text rides in the browser across the
+Stripe redirect, which means there is nothing to build and no policy text
+sitting on a server waiting to be breached.
+
+1. Visitor uploads 1-5 policies. Each gets a free on-screen summary (Agnes).
+2. They click **Get the report — S$4.90**. The extracted text goes into
+   `sessionStorage`; `/api/checkout` creates a Stripe session; the browser
+   redirects to Stripe.
+3. Stripe returns them to `/?report=<checkout_session_id>`.
+4. The page posts that id plus the stashed text to `/api/report`, which asks
+   Stripe whether the session is actually paid before doing any work.
+5. The finished report is cached in `localStorage`, so re-downloading the PDF
+   costs nothing and never touches the API again.
+
+### Two rules that must not be broken
+
+**Generate only after payment.** The expensive call sits on the far side of the
+paywall, so there is nothing to bypass and the Anthropic bill only moves when
+revenue does.
+
+**Release the claim when generation fails.** `/api/report` claims the payment
+before it starts work so two tabs cannot double-spend it — but every failure
+path calls `release()`. A customer whose report died on a transient API error
+has already paid and must be able to try again.
+
+### What is not yet handled
+
+- **Refunds are manual.** Errors surface the Stripe payment reference and ask
+  the customer to get in touch.
+- **A cleared browser loses the pending documents.** The payment is still
+  redeemable — re-uploading in the same browser regenerates the report without
+  a second charge — but if they clear storage entirely, that is a manual refund.
+- **No Stripe webhook.** Payment is verified by retrieving the session on
+  demand, which is sufficient for one-off purchases and needs no endpoint
+  secret. Add a webhook only if you move to subscriptions.

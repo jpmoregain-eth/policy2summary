@@ -1,17 +1,11 @@
-import { standardPrompt, executivePrompt, buildUserMessage } from '../../lib/prompts';
+import { standardPrompt, buildUserMessage } from '../../lib/prompts';
 import { condensePolicyText } from '../../lib/policy-text';
 import { parseModelJson } from '../../lib/json-response';
 
 export const config = { maxDuration: 60 };
 
 const MAX_INPUT_CHARS = 400000;
-
-// The executive report is the paid output, so it gets the larger slice of the
-// document. Both are far above the 5,000-character cap the client used to send.
-const CONTEXT_BUDGETS = {
-  executive: Number(process.env.EXECUTIVE_CONTEXT_CHARS || 45000),
-  standard: Number(process.env.ANALYZE_CONTEXT_CHARS || 30000)
-};
+const CONTEXT_BUDGET = Number(process.env.ANALYZE_CONTEXT_CHARS || 30000);
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -28,13 +22,18 @@ export default async function handler(req, res) {
       return res.status(413).json({ error: 'Document is too large to analyse. Please upload a shorter extract.' });
     }
 
-    const isExecutive = mode === 'executive';
+    if (mode !== 'standard') {
+      return res.status(402).json({
+        error: 'Full reports are a paid feature. Use /api/report after checkout.',
+        upgrade_required: true
+      });
+    }
 
     const providers = {
       agnes: {
         apiKey: process.env.AGNES_API_KEY || '',
         baseUrl: 'https://apihub.agnes-ai.com/v1',
-        model: isExecutive ? 'agnes-2.0-flash' : 'agnes-1.5-flash'
+        model: 'agnes-1.5-flash'
       },
       kimi: {
         apiKey: process.env.KIMI_API_KEY || '',
@@ -48,8 +47,8 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: `${provider} API not configured` });
     }
 
-    const systemPrompt = isExecutive ? executivePrompt() : standardPrompt();
-    const condensed = condensePolicyText(text, CONTEXT_BUDGETS[isExecutive ? 'executive' : 'standard']);
+    const systemPrompt = standardPrompt();
+    const condensed = condensePolicyText(text, CONTEXT_BUDGET);
 
     const response = await fetch(`${providerConfig.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -64,7 +63,7 @@ export default async function handler(req, res) {
           { role: 'user', content: buildUserMessage(condensed.text, { ...condensed, fileName }) }
         ],
         temperature: 0.1,
-        max_tokens: isExecutive ? 8000 : 6000
+        max_tokens: 6000
       })
     });
 
