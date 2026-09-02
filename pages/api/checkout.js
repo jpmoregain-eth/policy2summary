@@ -33,9 +33,12 @@ export default async function handler(req, res) {
     const { documentCount = 1 } = req.body || {};
     const count = Math.max(1, Math.min(Number(documentCount) || 1, REPORT.maxDocuments));
 
-    const origin = process.env.NEXT_PUBLIC_SITE_URL
-      || (req.headers.origin
-        || `https://${req.headers['x-forwarded-host'] || req.headers.host}`);
+    // A trailing slash here would produce '//?report=...' in the return URL,
+    // so normalise it rather than depending on whoever sets the variable.
+    const origin = (process.env.NEXT_PUBLIC_SITE_URL
+      || req.headers.origin
+      || `https://${req.headers['x-forwarded-host'] || req.headers.host}`
+    ).replace(/\/+$/, '');
 
     const stripe = new Stripe(secretKey);
 
