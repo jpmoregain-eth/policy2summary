@@ -14,9 +14,11 @@ const MAX_INPUT_CHARS = 600000;
  * Two things this route does that the Agnes routes cannot:
  *  - a 200K context window, so the Pro tier reads the whole policy wording
  *    instead of the first few pages;
- *  - prompt caching on the system prompt, which is identical on every request.
- *    The prompt is the largest fixed cost per call, and cache reads are ~10% of
- *    the input rate, so this is most of the per-call cost of the free tier.
+ *  - prompt caching on the system prompt, which is byte-identical on every
+ *    request in a mode. Worth having, but keep it in proportion: the prompt is
+ *    ~3.1K tokens against a document of up to ~37K, so caching trims a fraction
+ *    of a cent. Output tokens are the larger cost on the free tier, and the
+ *    document is the larger cost on Pro.
  *
  * Inert without ANTHROPIC_API_KEY — the existing routes are untouched.
  */

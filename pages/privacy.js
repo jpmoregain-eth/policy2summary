@@ -53,7 +53,7 @@ export default function PrivacyPolicy() {
           <section className="mb-8">
             <h2 className="text-xl font-semibold text-slate-900 mb-3">3. No Cookies or Tracking</h2>
             <p className="text-slate-600 leading-relaxed mb-3">
-              We do not use cookies, analytics trackers, or third-party advertising scripts. Your visit is completely anonymous.
+              We do not use advertising cookies or third-party advertising scripts. We use Vercel Analytics to count page views; it is cookieless and does not identify you personally, and it never sees your documents.
             </p>
           </section>
 
