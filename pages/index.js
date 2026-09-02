@@ -49,6 +49,14 @@ const truncateText = (text, maxLength) => {
   return truncated + '...';
 };
 
+// How much extracted text we keep client-side. The server decides how much of
+// it to actually send, so this only needs to be generous enough not to lose the
+// back half of a long policy wording before the API ever sees it.
+const MAX_RETAINED_CHARS = 200000;
+
+// Exclusions, sub-limits and charges usually sit well past page 20.
+const MAX_PDF_PAGES = 60;
+
 let pdfjsLib = null;
 
 const loadPdfJs = async () => {
@@ -183,6 +191,9 @@ const generateComparisonPdf = async (docs, comparison) => {
   if (comparison.total_annual_premium) finData.push(['Current Total Premium', comparison.total_annual_premium]);
   if (comparison.financial_optimization?.optimal_premium_estimate) finData.push(['Optimal Premium', comparison.financial_optimization.optimal_premium_estimate]);
   if (comparison.financial_optimization?.potential_savings) finData.push(['Potential Savings', comparison.financial_optimization.potential_savings]);
+  if (comparison.financial_optimization?.savings_note && !comparison.financial_optimization?.potential_savings) {
+    finData.push(['On Savings Estimates', comparison.financial_optimization.savings_note]);
+  }
   if (comparison.financial_optimization?.efficiency_score) finData.push(['Efficiency Score', comparison.financial_optimization.efficiency_score]);
 
   if (finData.length) {
@@ -300,7 +311,7 @@ const generateComparisonPdf = async (docs, comparison) => {
     pdf.setTextColor(...primaryColor);
     pdf.setFontSize(13);
     pdf.setFont('helvetica', 'bold');
-    pdf.text('Recommendation: Keep, Review, or Cancel', margin, y);
+    pdf.text('Per-Policy Verdict', margin, y);
     y += 10;
 
     const verdictData = comparison.keep_cancel_ranking.map(r => {
@@ -464,6 +475,12 @@ const generatePdfReport = async (doc, analysis) => {
     if (coverage?.riders_and_additions?.length || coverage?.riders_add_ons?.length) {
       (coverage.riders_and_additions || coverage.riders_add_ons).forEach(item => tableData.push(['Rider/Add-on', item]));
     }
+    if (coverage?.sub_limits?.length) {
+      coverage.sub_limits.forEach(item => tableData.push(['Sub-limit', item]));
+    }
+    if (coverage?.deductible_or_excess) {
+      tableData.push(['Deductible / Excess', coverage.deductible_or_excess]);
+    }
     if (coverage?.total_coverage_value) {
       tableData.push(['Total Coverage', coverage.total_coverage_value]);
     }
@@ -503,11 +520,24 @@ const generatePdfReport = async (doc, analysis) => {
     if (exclusions.limitations?.length) {
       exclusions.limitations.forEach(l => warnData.push(['Limitation', l]));
     }
-    if (exclusions.red_flags?.length) {
-      exclusions.red_flags.forEach(r => warnData.push(['Red Flag', r]));
+    if (exclusions.pre_existing_conditions) {
+      warnData.push(['Pre-Existing', exclusions.pre_existing_conditions]);
     }
     if (exclusions.waiting_periods?.length) {
       exclusions.waiting_periods.forEach(w => warnData.push(['Waiting Period', w]));
+    }
+    // red_flags carries objects now (severity / issue / why_it_matters /
+    // evidence); older responses returned plain strings, so handle both.
+    const redFlags = exclusions.red_flags || analysis.red_flags;
+    if (redFlags?.length) {
+      redFlags.forEach(r => {
+        if (typeof r === 'string') {
+          warnData.push(['Red Flag', r]);
+        } else if (r) {
+          const detail = [r.issue, r.why_it_matters].filter(Boolean).join(' — ');
+          warnData.push([`Red Flag (${r.severity || 'Note'})`, detail || '']);
+        }
+      });
     }
 
     if (warnData.length) {
@@ -524,6 +554,50 @@ const generatePdfReport = async (doc, analysis) => {
       });
       y = pdf.lastAutoTable.finalY + 10;
     }
+  }
+
+  // Not Found In This Document — the section that keeps a partial upload from
+  // reading as a clean bill of health.
+  if (analysis.not_found_in_document?.length) {
+    if (y > 220) { pdf.addPage(); y = 20; }
+    pdf.setTextColor(100, 116, 139);
+    pdf.setFontSize(14);
+    pdf.setFont('helvetica', 'bold');
+    pdf.text('Not Found In This Document', margin, y);
+    y += 10;
+    autoTable(pdf, {
+      startY: y,
+      margin: { left: margin, right: margin },
+      head: [['Looked for, not present in the text provided']],
+      body: analysis.not_found_in_document.map(item => [item]),
+      theme: 'grid',
+      headStyles: { fillColor: [100, 116, 139], textColor: 255, fontSize: 10 },
+      bodyStyles: { fontSize: 9, textColor: [55, 65, 81] },
+      alternateRowStyles: { fillColor: [248, 250, 252] },
+    });
+    y = pdf.lastAutoTable.finalY + 10;
+  }
+
+  // Questions For Your Agent
+  if (analysis.questions_for_your_agent?.length) {
+    if (y > 220) { pdf.addPage(); y = 20; }
+    pdf.setTextColor(16, 185, 129);
+    pdf.setFontSize(14);
+    pdf.setFont('helvetica', 'bold');
+    pdf.text('Questions To Ask Your Agent', margin, y);
+    y += 10;
+    autoTable(pdf, {
+      startY: y,
+      margin: { left: margin, right: margin },
+      head: [['#', 'Question']],
+      body: analysis.questions_for_your_agent.map((q, i) => [String(i + 1), q]),
+      theme: 'grid',
+      headStyles: { fillColor: [16, 185, 129], textColor: 255, fontSize: 10 },
+      bodyStyles: { fontSize: 9, textColor: [55, 65, 81] },
+      columnStyles: { 0: { cellWidth: 10, fontStyle: 'bold' } },
+      alternateRowStyles: { fillColor: [240, 253, 244] },
+    });
+    y = pdf.lastAutoTable.finalY + 10;
   }
 
   // Financial Analysis
@@ -642,7 +716,7 @@ function Home() {
         loadingTask.promise.then(pdf => {
           clearTimeout(timeoutId);
           let fullText = '';
-          const maxPages = Math.min(pdf.numPages, 20);
+          const maxPages = Math.min(pdf.numPages, MAX_PDF_PAGES);
 
           const extractPages = async () => {
             try {
@@ -690,7 +764,7 @@ function Home() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
-        body: JSON.stringify({ text })
+        body: JSON.stringify({ text, fileName: documents.find(d => d.id === id)?.file?.name || null })
       });
 
       clearTimeout(timeoutId);
@@ -748,7 +822,8 @@ function Home() {
           body: JSON.stringify({
             text: doc.extractedText,
             mode: 'executive',
-            provider: provider.key
+            provider: provider.key,
+            fileName: doc.file?.name || null
           })
         });
 
@@ -937,7 +1012,7 @@ function Home() {
         return;
       }
 
-      updateDoc(id, { extractedText: text.substring(0, 5000), needsPassword: false, pendingBuffer: null, stage: 'analyzing', extractProgress: null });
+      updateDoc(id, { extractedText: text.substring(0, MAX_RETAINED_CHARS), needsPassword: false, pendingBuffer: null, stage: 'analyzing', extractProgress: null });
       await analyzeDocText(text, id);
 
     } catch (err) {
@@ -974,7 +1049,7 @@ function Home() {
         return;
       }
 
-      updateDoc(id, { extractedText: text.substring(0, 5000), pendingBuffer: null, stage: 'analyzing', extractProgress: null });
+      updateDoc(id, { extractedText: text.substring(0, MAX_RETAINED_CHARS), pendingBuffer: null, stage: 'analyzing', extractProgress: null });
       await analyzeDocText(text, id);
     } catch (err) {
       if (err.message === 'PASSWORD_REQUIRED') {
@@ -2164,20 +2239,93 @@ function AnalysisResults({ analysis }) {
         </div>
       )}
 
-      {/* Warnings */}
-      {analysis.warnings_and_gaps?.length > 0 && (
+      {/* Warnings. The model returns these under `warnings`; `warnings_and_gaps`
+          was the key this block used to read, which no prompt ever produced, so
+          the section never rendered. Accept both. */}
+      {(analysis.warnings_and_gaps?.length > 0 || analysis.warnings?.length > 0) && (
         <div className="bg-amber-50 border border-amber-200 rounded-xl p-5">
           <h3 className="text-sm font-semibold text-amber-800 mb-3 flex items-center gap-2">
             <svg className="w-4 h-4 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
             </svg>
-            ⚠️ Warnings & Gaps
+            Warnings & Gaps
           </h3>
           <ul className="space-y-1.5 text-sm text-amber-800 list-disc list-inside">
-            {analysis.warnings_and_gaps.map((item, i) => (
+            {(analysis.warnings_and_gaps || analysis.warnings).map((item, i) => (
+              <li key={i}>{typeof item === 'string' ? item : item?.issue || ''}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Red flags, ranked by what they cost at claim time. */}
+      {analysis.red_flags?.length > 0 && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-5">
+          <h3 className="text-sm font-semibold text-red-800 mb-3">Red Flags</h3>
+          <ul className="space-y-3">
+            {analysis.red_flags.map((flag, i) => (
+              <li key={i} className="text-sm">
+                <div className="flex items-start gap-2">
+                  <span className={`shrink-0 mt-0.5 px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wide ${
+                    flag?.severity === 'High' ? 'bg-red-600 text-white'
+                      : flag?.severity === 'Medium' ? 'bg-amber-500 text-white'
+                      : 'bg-slate-400 text-white'
+                  }`}>
+                    {flag?.severity || 'Note'}
+                  </span>
+                  <div>
+                    <p className="text-slate-900 font-medium">{flag?.issue}</p>
+                    {flag?.why_it_matters && (
+                      <p className="text-slate-600 mt-0.5">{flag.why_it_matters}</p>
+                    )}
+                    {flag?.evidence && (
+                      <p className="text-slate-500 italic mt-0.5 text-xs">&ldquo;{flag.evidence}&rdquo;</p>
+                    )}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* What the document does not say. Distinct from what it excludes. */}
+      {analysis.not_found_in_document?.length > 0 && (
+        <div className="bg-slate-50 border border-slate-200 rounded-xl p-5">
+          <h3 className="text-sm font-semibold text-slate-800 mb-1">Not Found In This Document</h3>
+          <p className="text-xs text-slate-500 mb-3">
+            These were looked for and not found in the text provided. That is not the same as being excluded &mdash; they may sit in wording that was not uploaded.
+          </p>
+          <ul className="space-y-1.5 text-sm text-slate-700 list-disc list-inside">
+            {analysis.not_found_in_document.map((item, i) => (
               <li key={i}>{item}</li>
             ))}
           </ul>
+        </div>
+      )}
+
+      {/* The gaps above, turned into something the reader can act on. */}
+      {analysis.questions_for_your_agent?.length > 0 && (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-5">
+          <h3 className="text-sm font-semibold text-emerald-800 mb-3">Questions To Ask Your Agent</h3>
+          <ol className="space-y-1.5 text-sm text-emerald-900 list-decimal list-inside">
+            {analysis.questions_for_your_agent.map((q, i) => (
+              <li key={i}>{q}</li>
+            ))}
+          </ol>
+        </div>
+      )}
+
+      {/* Says plainly what was read, so a partial upload is never mistaken for a full review. */}
+      {analysis.document_assessment && (
+        <div className="border border-slate-200 rounded-xl p-4 text-xs text-slate-500">
+          <span className="font-semibold text-slate-600">Document read:</span>{' '}
+          {analysis.document_assessment.document_kind || 'Unclear'}
+          {analysis.document_assessment.completeness && ` \u00b7 ${analysis.document_assessment.completeness}`}
+          {analysis.document_assessment.confidence && ` \u00b7 Confidence: ${analysis.document_assessment.confidence}`}
+          {analysis.document_assessment.completeness_note && (
+            <p className="mt-1">{analysis.document_assessment.completeness_note}</p>
+          )}
         </div>
       )}
     </div>
@@ -2241,6 +2389,11 @@ function ComparisonResults({ comparison, docs, onExportPdf, pdfGenerating }) {
             <div className="bg-white border border-slate-200 rounded-xl p-4 text-center">
               <p className="text-xs text-slate-500 mb-1">Optimal Premium</p>
               <p className="text-lg font-bold text-emerald-600">{comparison.financial_optimization.optimal_premium_estimate}</p>
+            </div>
+          )}
+          {comparison.financial_optimization?.savings_note && !comparison.financial_optimization?.potential_savings && (
+            <div className="sm:col-span-2">
+              <p className="text-xs text-slate-500">{comparison.financial_optimization.savings_note}</p>
             </div>
           )}
           {comparison.financial_optimization?.potential_savings && (
@@ -2345,14 +2498,14 @@ function ComparisonResults({ comparison, docs, onExportPdf, pdfGenerating }) {
         </div>
       )}
 
-      {/* Keep / Cancel / Review */}
+      {/* Per-policy verdict */}
       {comparison.keep_cancel_ranking?.length > 0 && (
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           <h3 className="text-sm font-semibold text-slate-800 p-4 border-b border-slate-100 flex items-center gap-2">
             <svg className="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
-            Recommendation: Keep, Review, or Cancel
+            Per-Policy Verdict
           </h3>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">

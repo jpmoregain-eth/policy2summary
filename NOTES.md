@@ -6,10 +6,13 @@
 
 ## What This Is
 
-AI-powered insurance document summarizer. Two-tier:
-- **Free**: Quick summary via `/api/analyze` (agnes-1.5-flash, 55s timeout)
-- **Premium**: Executive PDF report via `/api/analyze-fallback` (agnes-1.5-pro, 25s per attempt, 4 retries with 10s backoff)
-- **Endgame**: Multi-policy comparison via `/api/analyze-compare` (analyzes 2+ docs together, generates consolidated comparison PDF)
+AI-powered insurance document summarizer.
+- **Quick summary** via `/api/analyze` (agnes-2.0-flash, 55s timeout)
+- **Executive PDF report** via `/api/analyze-fallback` (agnes-2.0-flash, 25s per attempt, 4 retries with 10s backoff)
+- **Multi-policy comparison** via `/api/analyze-compare` (analyzes 2+ docs together, generates consolidated comparison PDF)
+- **Claude Haiku 4.5 route** via `/api/analyze-claude` — tier-aware, handles all three modes, inert unless `ANTHROPIC_API_KEY` is set
+
+Note: nothing is actually gated behind payment yet. Every feature is free to every visitor.
 
 Domain: **policy2summary.com**
 Repo: **jpmoregain-eth/policy2summary**
@@ -30,14 +33,24 @@ Repo: **jpmoregain-eth/policy2summary**
 ### API Routes
 | Route | Purpose | Model | Timeout |
 |-------|---------|-------|---------|
-| `/api/analyze` | Free quick summary | agnes-1.5-flash | 55s |
-| `/api/analyze-fallback` | Premium executive PDF | agnes-1.5-pro | 25s per attempt |
-| `/api/analyze-compare` | Multi-policy comparison | agnes-1.5-pro | 55s |
+| `/api/analyze` | Quick summary | agnes-2.0-flash | 55s |
+| `/api/analyze-fallback` | Executive PDF + Kimi fallback | agnes-2.0-flash / kimi-k2.6 | 25s per attempt |
+| `/api/analyze-compare` | Multi-policy comparison | agnes-2.0-flash | 55s |
+| `/api/analyze-claude` | Tier-aware analysis (all modes) | claude-haiku-4-5 | 60s |
+
+All four routes now export `config = { maxDuration: 60 }` — without it Vercel
+applied its default limit regardless of the Pro plan.
 
 ### Environment Variables (Vercel)
 ```
-AGNES_API_KEY=<key>    # Required for all AI calls
-KIMI_API_KEY=<key>     # Fallback provider (optional)
+AGNES_API_KEY=<key>          # Required for the Agnes routes
+KIMI_API_KEY=<key>           # Fallback provider (optional)
+ANTHROPIC_API_KEY=<key>      # Enables /api/analyze-claude (optional)
+
+# Optional tuning — how many characters of the document each mode sends
+ANALYZE_CONTEXT_CHARS=30000
+EXECUTIVE_CONTEXT_CHARS=45000
+COMPARE_CONTEXT_CHARS=60000
 ```
 - **NEVER hardcode API keys in source** — GitHub push protection will block commits containing keys
 - Kimi endpoint: `https://api.moonshot.ai/v1` (NOT apihub.agnes-ai.com)
@@ -244,10 +257,11 @@ try {
 
 | Feature | Model | Why |
 |---------|-------|-----|
-| Free summary | `agnes-1.5-flash` | Fast, cheap, good enough for basic extraction |
-| Executive PDF | `agnes-1.5-pro` | Higher quality, deeper analysis for paid tier |
-| Comparison | `agnes-1.5-pro` | Complex multi-doc reasoning needs pro |
-| Fallback | `kimi` (moonshot) | Backup when Agnes is rate-limited |
+| Quick summary | `agnes-2.0-flash` | Fast, cheap, good enough for basic extraction |
+| Executive PDF | `agnes-2.0-flash` | Deeper prompt, same model |
+| Comparison | `agnes-2.0-flash` | Multi-doc reasoning |
+| Fallback | `kimi-k2.6` (moonshot) | Backup when Agnes is rate-limited |
+| Tiered route | `claude-haiku-4-5` | 200K context (reads whole policies), prompt caching, stable JSON |
 
 ---
 
@@ -255,11 +269,67 @@ try {
 
 | File | Purpose |
 |------|---------|
-| `pages/index.js` | Main UI — 2000+ lines, be careful with large edits |
-| `pages/api/analyze.js` | Free summary endpoint |
-| `pages/api/analyze-fallback.js` | Premium executive endpoint |
+| `pages/index.js` | Main UI — 2400+ lines, be careful with large edits |
+| `lib/prompts.js` | **Every analysis prompt lives here.** Single source of truth |
+| `lib/policy-text.js` | Signal-weighted condensation — keeps exclusions, drops boilerplate |
+| `lib/json-response.js` | Tolerant JSON parsing, including repair of truncated responses |
+| `lib/tiers.js` | Free / Pro tier definitions |
+| `pages/api/analyze.js` | Quick summary endpoint |
+| `pages/api/analyze-fallback.js` | Executive endpoint with provider fallback |
 | `pages/api/analyze-compare.js` | Multi-policy comparison endpoint |
+| `pages/api/analyze-claude.js` | Claude Haiku 4.5, tier-aware |
 | `public/googlef0b1253b37cd8c20.html` | Google Search Console verification |
+
+---
+
+## Prompt Design Rules
+
+`lib/prompts.js` is the whole prompt surface. Never paste prompt text into a
+route — the two copies that used to live in `analyze.js` and
+`analyze-fallback.js` had already drifted apart.
+
+Three rules do most of the work and should not be relaxed:
+
+1. **Missing means null.** A guessed policy number is worse than a blank one.
+2. **Absence is not exclusion.** The model must never write "this policy does
+   not cover X" when it means "X was not in the text I was given". Anything it
+   looked for and could not find goes into `not_found_in_document`.
+3. **No invented market pricing.** The model has no quotes, no competitor
+   rates and no underwriting data. `optimal_premium_estimate` and
+   `potential_savings` are deliberately hard-nulled in the comparison prompt —
+   a confident fake savings figure could push someone to cancel cover they
+   cannot be underwritten for again.
+
+`DOMAIN_CHECKLIST` is the quality lever. It tells the model where the money
+hides in an insurance contract — sub-limits, waiting periods, allocation rates,
+bid-offer spreads, incontestability windows. Extend it rather than rewriting
+the schemas.
+
+### Fields the prompts return
+
+Beyond the original keys (all preserved), responses now carry
+`document_assessment`, `not_found_in_document`, `questions_for_your_agent`,
+`red_flags` (objects with `severity` / `issue` / `why_it_matters` /
+`evidence`), `market_context`, and per-section `evidence` quotes. All are
+rendered on-page and in the executive PDF.
+
+---
+
+## How Much Of The Document Gets Read
+
+This was the single largest quality bug. The client capped `extractedText` at
+5,000 characters, so the executive report and the comparison — the deeper
+analyses — saw *less* of the policy than the free summary, which sent the full
+text and let the server truncate at 8,000. Both are gone.
+
+- Client keeps up to `MAX_RETAINED_CHARS` (200,000) and reads up to
+  `MAX_PDF_PAGES` (60) pages, up from 20.
+- The server decides the budget per mode and condenses with
+  `condensePolicyText`, which keeps the front matter whole and then spends the
+  rest of the budget on the highest-signal passages, in document order, marking
+  each cut with `[...]`.
+- Whenever text is dropped the model is told so explicitly, so a partial upload
+  is reported as partial rather than as a clean bill of health.
 
 ---
 
@@ -284,7 +354,7 @@ try {
 
 ---
 
-*Last updated: 2026-05-19 by GoldmanSax*
+*Last updated: 2026-09-02 — prompt overhaul, context-budget fixes, Claude Haiku tier route.*
 
 ## Contact
 - **Email:** thejpmoregainproject@gmail.com
