@@ -6,10 +6,23 @@
 
 ## What This Is
 
-AI-powered insurance document summarizer, with one paid product.
+AI-powered insurance document summarizer.
 
-- **Free**: per-policy summary on screen via `/api/analyze` (agnes-3.0-flash). 3 per IP per day. No PDF.
-- **Paid — the report**: `S$4.90` one-off. Upload 1-5 policies, pay, get one combined PDF. Runs on `claude-haiku-4-5` via `/api/report`.
+- **Per-policy summary** on screen via `/api/analyze` (agnes-3.0-flash). 3 per IP per day.
+- **The report** — 1-5 policies read in full and assessed together, as one PDF, via `/api/report`.
+
+**The report is free or paid depending on configuration, with no flag to set.**
+`paidReportsEnabled()` in `lib/tiers.js` returns true only when both
+`STRIPE_SECRET_KEY` and `ANTHROPIC_API_KEY` are present:
+
+| Keys | Report costs | Runs on | Metered by |
+|------|--------------|---------|-----------|
+| Neither | Free | `agnes-3.0-flash` | 2 per IP per day |
+| Both | S$4.90 | `claude-haiku-4-5` | Stripe payment |
+
+Adding the two keys in Vercel is the whole of "turn on payments" — no deploy,
+no code change. `/api/config` tells the page which world it is in so the button
+says the right thing before anyone clicks it.
 
 **The product is the report.** Priced per report, not per policy — one price whether
 you upload one policy or five. Charging per policy would tax the exact behaviour
@@ -37,7 +50,8 @@ Repo: **jpmoregain-eth/policy2summary**
 | `/api/analyze` | Free per-policy summary, rate limited | agnes-3.0-flash | No |
 | `/api/analyze-fallback` | Free summary, alternate provider | agnes-3.0-flash / kimi-k2.6 | No |
 | `/api/checkout` | Creates a Stripe Checkout session | — | — |
-| `/api/report` | The paid combined report | claude-haiku-4-5 | **Yes** |
+| `/api/config` | Tells the page whether reports are paid | — | — |
+| `/api/report` | The combined report | haiku-4-5 or agnes-3.0-flash | **When configured** |
 | `/api/analyze-compare` | Retired stub, returns 402 | — | — |
 
 Every route exports `config = { maxDuration: 60 }` — without it Vercel applied
@@ -61,8 +75,10 @@ AGNES_MODEL=agnes-3.0-flash  # optional, this is the default
 AGNES_BASE_URL=https://apihub.agnes-ai.com/v1   # optional
 KIMI_MODEL=kimi-k2.6         # optional
 
+# Setting BOTH of these switches reports from free to paid. Setting neither
+# leaves reports free, running on Agnes. Do not set only one.
 ANTHROPIC_API_KEY=<key>      # Paid reports only — spent only when revenue arrives
-STRIPE_SECRET_KEY=<key>      # Enables /api/checkout and /api/report
+STRIPE_SECRET_KEY=<key>      # Enables /api/checkout
 NEXT_PUBLIC_SITE_URL=https://policy2summary.com   # Stripe return URLs
 
 # Shared state for rate limiting and payment redemption. WITHOUT THESE THE

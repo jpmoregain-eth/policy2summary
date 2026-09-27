@@ -4,8 +4,8 @@
 
 No signup. No data stored.
 
-- **Free** — a plain-English summary of each policy, on screen.
-- **Full report, S$4.90** — upload up to 5 policies, get one combined PDF that reads the whole wording. One price whether you upload one policy or five.
+- **Summary** — a plain-English summary of each policy, on screen.
+- **Full report** — upload up to 5 policies, get one combined PDF that reads the whole wording.
 
 ## What It Does
 

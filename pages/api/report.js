@@ -3,8 +3,9 @@ import Anthropic from '@anthropic-ai/sdk';
 import { executivePrompt, comparePrompt, buildUserMessage, buildComparisonMessage } from '../../lib/prompts';
 import { condensePolicyText } from '../../lib/policy-text';
 import { parseModelJson } from '../../lib/json-response';
-import { REPORT, modeForDocumentCount } from '../../lib/tiers';
-import { claimOnce, release, isShared } from '../../lib/store';
+import { REPORT, modeForDocumentCount, paidReportsEnabled, FREE_REPORTS_PER_DAY } from '../../lib/tiers';
+import { claimOnce, release, isShared, rateLimit, clientKey } from '../../lib/store';
+import { chatCompletion } from '../../lib/providers';
 
 export const config = { maxDuration: 60 };
 
@@ -26,16 +27,12 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const stripeKey = process.env.STRIPE_SECRET_KEY || '';
-  const anthropicKey = process.env.ANTHROPIC_API_KEY || '';
-  if (!stripeKey || !anthropicKey) {
-    return res.status(503).json({ error: 'Paid reports are not enabled on this deployment.' });
-  }
+  const paid = paidReportsEnabled();
 
   try {
     const { sessionId, documents } = req.body || {};
 
-    if (!sessionId || typeof sessionId !== 'string') {
+    if (paid && (!sessionId || typeof sessionId !== 'string')) {
       return res.status(400).json({ error: 'Missing payment reference.' });
     }
     if (!Array.isArray(documents) || documents.length < REPORT.minDocuments) {
@@ -53,38 +50,60 @@ export default async function handler(req, res) {
       return res.status(413).json({ error: 'Those documents are too large to analyse.' });
     }
 
-    // 1. Confirm the money actually arrived. Stripe is the source of truth;
-    //    nothing the browser sends is trusted here beyond the session id.
-    const stripe = new Stripe(stripeKey);
-    let session;
-    try {
-      session = await stripe.checkout.sessions.retrieve(sessionId);
-    } catch (err) {
-      return res.status(404).json({ error: 'That payment reference could not be found.' });
+    let freeLimit = null;
+
+    if (paid) {
+      // 1. Confirm the money actually arrived. Stripe is the source of truth;
+      //    nothing the browser sends is trusted here beyond the session id.
+      const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+      let session;
+      try {
+        session = await stripe.checkout.sessions.retrieve(sessionId);
+      } catch (err) {
+        return res.status(404).json({ error: 'That payment reference could not be found.' });
+      }
+
+      if (session.payment_status !== 'paid') {
+        return res.status(402).json({ error: 'This payment has not completed.', payment_status: session.payment_status });
+      }
+
+      // 2. One generation per payment. The client caches the result so ordinary
+      //    re-downloads never come back here.
+      const claimed = await claimOnce(`report:${sessionId}`, REDEMPTION_TTL_SECONDS);
+      if (!claimed) {
+        return res.status(409).json({
+          error: 'This report has already been generated. It is saved in this browser — reload the page to download it again.',
+          already_redeemed: true
+        });
+      }
+      if (!isShared()) {
+        console.warn('Redemption claimed in per-instance memory: set KV_REST_API_URL/TOKEN so it holds across invocations.');
+      }
+    } else {
+      // Free mode: nothing to verify, so the meter is the only thing standing
+      // between this route and an open LLM proxy.
+      freeLimit = await rateLimit(`freereport:${clientKey(req)}`, FREE_REPORTS_PER_DAY, 24 * 60 * 60);
+      if (!freeLimit.allowed) {
+        return res.status(429).json({
+          error: `That is ${FREE_REPORTS_PER_DAY} full reports today. Come back tomorrow.`,
+          limit_reached: true
+        });
+      }
+      if (!isShared()) {
+        console.warn('Free report limit is per-instance: set KV_REST_API_URL/TOKEN to enforce it.');
+      }
     }
 
-    if (session.payment_status !== 'paid') {
-      return res.status(402).json({ error: 'This payment has not completed.', payment_status: session.payment_status });
-    }
-
-    // 2. One generation per payment. The client caches the result so ordinary
-    //    re-downloads never come back here.
-    const claimed = await claimOnce(`report:${sessionId}`, REDEMPTION_TTL_SECONDS);
-    if (!claimed) {
-      return res.status(409).json({
-        error: 'This report has already been generated. It is saved in this browser — reload the page to download it again.',
-        already_redeemed: true
-      });
-    }
-    if (!isShared()) {
-      console.warn('Redemption claimed in per-instance memory: set KV_REST_API_URL/TOKEN so it holds across invocations.');
-    }
+    /** Hands back whatever was spent to get here, so a failure costs nobody. */
+    const refund = async () => {
+      if (paid) await release(`report:${sessionId}`);
+      else if (freeLimit) await freeLimit.refund();
+    };
 
     // 3. Do the work. From here on every failure path must release the claim —
     //    a customer whose report died on a transient API error has to be able
     //    to try again, and they have already paid.
     const mode = modeForDocumentCount(documents.length);
-    const client = new Anthropic({ apiKey: anthropicKey });
 
     let systemPrompt;
     let userMessage;
@@ -110,48 +129,67 @@ export default async function handler(req, res) {
       userMessage = buildUserMessage(condensed.text, { ...condensed, fileName: only.name || null });
     }
 
-    let response;
+    let content = '';
+    let usage = {};
+    let usedModel;
+    let usedProvider;
+
     try {
-      response = await client.messages.create({
-        model: REPORT.model,
-        max_tokens: REPORT.maxTokens,
-        temperature: 0.1,
-        system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
-        messages: [{ role: 'user', content: userMessage }]
-      });
+      if (paid) {
+        const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        const response = await client.messages.create({
+          model: REPORT.model,
+          max_tokens: REPORT.maxTokens,
+          temperature: 0.1,
+          // Byte-identical across every request in a mode, so it caches.
+          system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+          messages: [{ role: 'user', content: userMessage }]
+        });
+
+        if (response.stop_reason === 'refusal') {
+          await refund();
+          return res.status(422).json({ error: 'Those documents could not be analysed. Contact us with your payment reference for a refund.' });
+        }
+
+        content = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+        usage = response.usage || {};
+        usedModel = REPORT.model;
+        usedProvider = 'anthropic';
+      } else {
+        const result = await chatCompletion('agnes', {
+          system: systemPrompt,
+          user: userMessage,
+          maxTokens: REPORT.maxTokens
+        });
+        content = result.content;
+        usedModel = result.model;
+        usedProvider = 'agnes';
+      }
     } catch (err) {
-      await release(`report:${sessionId}`);
+      await refund();
       throw err;
     }
 
-    if (response.stop_reason === 'refusal') {
-      await release(`report:${sessionId}`);
-      return res.status(422).json({ error: 'Those documents could not be analysed. Contact us with your payment reference for a refund.' });
-    }
-
-    const content = response.content
-      .filter(block => block.type === 'text')
-      .map(block => block.text)
-      .join('');
-
     const parsed = parseModelJson(content);
     if (!parsed.ok) {
-      console.error('Paid report parse failed:', parsed.reason, 'Sample:', parsed.sample);
-      await release(`report:${sessionId}`);
+      console.error('Report parse failed:', parsed.reason, 'Sample:', parsed.sample);
+      await refund();
       return res.status(500).json({
-        error: 'The report could not be generated, and you have not been charged for a second attempt. Please try again.',
-        sessionId,
+        error: paid
+          ? 'The report could not be generated, and you have not been charged for a second attempt. Please try again.'
+          : 'The report could not be generated. Please try again.',
+        sessionId: paid ? sessionId : undefined,
         retry: true
       });
     }
 
-    const usage = response.usage || {};
     const payload = {
       mode,
-      sessionId,
+      paid,
+      sessionId: paid ? sessionId : null,
       meta: {
-        provider: 'anthropic',
-        model: REPORT.model,
+        provider: usedProvider,
+        model: usedModel,
         documents: documents.length,
         truncated,
         chars_analysed: charsAnalysed,
@@ -172,14 +210,16 @@ export default async function handler(req, res) {
     res.status(200).json(payload);
 
   } catch (err) {
+    const safeNote = paidReportsEnabled() ? ' Your payment is safe —' : '';
+
     if (err instanceof Anthropic.RateLimitError) {
-      return res.status(429).json({ error: 'The AI service is busy. Your payment is safe — try again in a minute.', retry: true });
+      return res.status(429).json({ error: `The AI service is busy.${safeNote} try again in a minute.`, retry: true });
     }
-    if (err instanceof Anthropic.APIError) {
-      console.error(`Anthropic API error ${err.status}:`, err.message);
-      return res.status(502).json({ error: 'The AI service is temporarily unavailable. Your payment is safe — try again shortly.', retry: true });
+    if (err instanceof Anthropic.APIError || err.status) {
+      console.error(`Report provider error ${err.status}:`, err.message, err.detail || '');
+      return res.status(502).json({ error: `The AI service is temporarily unavailable.${safeNote} try again shortly.`, retry: true });
     }
     console.error('Report generation error:', err);
-    res.status(500).json({ error: 'Report generation failed. Contact us with your payment reference.', retry: true });
+    res.status(500).json({ error: 'Report generation failed. Please try again.', retry: true });
   }
 }

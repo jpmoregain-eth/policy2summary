@@ -744,6 +744,9 @@ function Home() {
   const [pdfGenerating, setPdfGenerating] = useState(false);
   // idle | starting | generating | ready | error
   const [report, setReport] = useState({ status: 'idle', error: '', data: null, mode: null, sessionId: null });
+  // Whether reports are sold or given away. The server decides, from whether
+  // payment is configured; the page just asks.
+  const [paidReports, setPaidReports] = useState(false);
   const fileInputRefs = useRef({});
 
   const updateDoc = (id, updates) => {
@@ -874,6 +877,41 @@ function Home() {
     }
   }, []);
 
+  /** Generates the report directly, with nothing to pay. */
+  const requestFreeReport = async () => {
+    if (!reportableDocs.length) return;
+    setReport({ status: 'generating', error: '', data: null, mode: null, sessionId: null });
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 58000);
+
+    try {
+      const res = await fetch('/api/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({ documents: reportableDocs })
+      });
+      clearTimeout(timeoutId);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'The report could not be generated.');
+
+      const payload = { ...data, documents: reportableDocs.map(d => ({ name: d.name })) };
+      setReport({ status: 'ready', error: '', data: payload, mode: payload.mode, sessionId: null });
+      if (payload.mode === 'compare' && payload.comparison) setComparisonResult(payload.comparison);
+      downloadReportPdf(payload);
+    } catch (err) {
+      clearTimeout(timeoutId);
+      setReport({
+        status: 'error',
+        error: err.name === 'AbortError'
+          ? 'That took longer than expected. Please try again.'
+          : (err.message || 'The report could not be generated.'),
+        data: null, mode: null, sessionId: null
+      });
+    }
+  };
+
   /** Sends the browser to Stripe, leaving the document text behind in the tab. */
   const startCheckout = async () => {
     if (!reportableDocs.length) return;
@@ -897,6 +935,9 @@ function Home() {
       setReport({ status: 'error', error: err.message || 'Could not start checkout.', data: null, mode: null, sessionId: null });
     }
   };
+
+  /** The one thing the report button does, whichever world we are in. */
+  const requestReport = () => (paidReports ? startCheckout() : requestFreeReport());
 
   /** Asks the server for the report once Stripe has confirmed the payment. */
   const generateReport = useCallback(async (sessionId) => {
@@ -954,6 +995,15 @@ function Home() {
       setReport({ status: 'error', error: message, data: null, mode: null, sessionId });
     }
   }, [downloadReportPdf]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    fetch('/api/config')
+      .then(r => r.json())
+      .then(cfg => { if (!cancelled) setPaidReports(Boolean(cfg.paidReports)); })
+      .catch(() => { /* stay on the free wording */ });
+    return () => { cancelled = true; };
+  }, []);
 
   // Coming back from Stripe: ?report=<checkout session id>
   React.useEffect(() => {
@@ -1437,7 +1487,7 @@ function Home() {
             <a href="#upload-section" className="hidden sm:inline-flex text-sm text-slate-500 hover:text-slate-800 transition-colors font-medium">Analyze</a>
             {reportableDocs.length > 0 && report.status !== 'ready' && (
               <button
-                onClick={startCheckout}
+                onClick={requestReport}
                 disabled={report.status === 'starting' || report.status === 'generating'}
                 className="inline-flex items-center gap-1 sm:gap-2 px-2.5 sm:px-3.5 py-1.5 sm:py-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white rounded-lg text-xs sm:text-sm font-medium transition-colors shadow-sm"
               >
@@ -1448,7 +1498,7 @@ function Home() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
                 )}
-                <span className="hidden sm:inline">Get full report &middot; {REPORT_PRICE}</span>
+                <span className="hidden sm:inline">Get full report{paidReports ? ` \u00b7 ${REPORT_PRICE}` : ''}</span>
                 <span className="sm:hidden">Report</span>
               </button>
             )}
@@ -1917,8 +1967,8 @@ function Home() {
                       </p>
                     </div>
                     <div className="text-right">
-                      <div className="text-2xl font-bold text-slate-900">{REPORT_PRICE}</div>
-                      <div className="text-xs text-slate-500">one-off &middot; no account</div>
+                      <div className="text-2xl font-bold text-slate-900">{paidReports ? REPORT_PRICE : 'Free'}</div>
+                      <div className="text-xs text-slate-500">{paidReports ? 'one-off \u00b7 no account' : 'no signup'}</div>
                     </div>
                   </div>
 
@@ -1932,13 +1982,15 @@ function Home() {
                   </ul>
 
                   <button
-                    onClick={startCheckout}
+                    onClick={requestReport}
                     className="mt-6 w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-semibold transition-colors shadow-sm"
                   >
-                    Get the report &middot; {REPORT_PRICE}
+                    {paidReports ? `Get the report \u00b7 ${REPORT_PRICE}` : 'Get the report'}
                   </button>
                   <p className="text-xs text-slate-400 mt-3">
-                    Same price whether you upload one policy or {MAX_REPORT_DOCS}. Your documents stay in this browser until you pay.
+                    {paidReports
+                      ? `Same price whether you upload one policy or ${MAX_REPORT_DOCS}. Your documents stay in this browser until you pay.`
+                      : `Covers up to ${MAX_REPORT_DOCS} policies in one report. Nothing is stored.`}
                   </p>
                 </div>
               </div>
@@ -1981,7 +2033,9 @@ function Home() {
                   </button>
                 </div>
                 <p className="text-xs text-slate-500 mt-3">
-                  Saved in this browser \u2014 you can download it again any time without paying twice.
+                  {paidReports
+                    ? 'Saved in this browser \u2014 you can download it again any time without paying twice.'
+                    : 'Download it as many times as you like.'}
                 </p>
               </div>
             )}
