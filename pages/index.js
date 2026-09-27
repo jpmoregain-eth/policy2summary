@@ -49,6 +49,69 @@ const truncateText = (text, maxLength) => {
   return truncated + '...';
 };
 
+// The paid report is priced per report, not per policy — one price whether you
+// upload one policy or five.
+const REPORT_PRICE = 'S$4.90';
+const MAX_REPORT_DOCS = 5;
+
+// Document text has to survive a redirect to Stripe and back. It rides in the
+// browser rather than on a server, so there is no database to build and no
+// policy text sitting in storage waiting to be breached.
+const PENDING_KEY = 'p2s:pending-report';
+const reportCacheKey = (sessionId) => `p2s:report:${sessionId}`;
+
+// Per-document ceiling on what we stash. The server condenses anyway, so
+// sending more than this would only bloat sessionStorage.
+const STASH_CHARS = 150000;
+
+const stashPendingDocs = (docs) => {
+  try {
+    sessionStorage.setItem(PENDING_KEY, JSON.stringify(
+      docs.map(d => ({ name: d.name, text: String(d.text || '').substring(0, STASH_CHARS) }))
+    ));
+    return true;
+  } catch (err) {
+    console.error('Could not stash documents for checkout:', err);
+    return false;
+  }
+};
+
+const readPendingDocs = () => {
+  try {
+    const raw = sessionStorage.getItem(PENDING_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (err) {
+    return null;
+  }
+};
+
+const clearPendingDocs = () => {
+  try { sessionStorage.removeItem(PENDING_KEY); } catch (err) { /* nothing to do */ }
+};
+
+// Caching the finished report locally means re-downloading the PDF costs
+// nothing — the server is only asked to generate it once per payment.
+const cacheReport = (sessionId, payload) => {
+  try { localStorage.setItem(reportCacheKey(sessionId), JSON.stringify(payload)); } catch (err) { /* quota */ }
+};
+
+const readCachedReport = (sessionId) => {
+  try {
+    const raw = localStorage.getItem(reportCacheKey(sessionId));
+    return raw ? JSON.parse(raw) : null;
+  } catch (err) {
+    return null;
+  }
+};
+
+// How much extracted text we keep client-side. The server decides how much of
+// it to actually send, so this only needs to be generous enough not to lose the
+// back half of a long policy wording before the API ever sees it.
+const MAX_RETAINED_CHARS = 200000;
+
+// Exclusions, sub-limits and charges usually sit well past page 20.
+const MAX_PDF_PAGES = 60;
+
 let pdfjsLib = null;
 
 const loadPdfJs = async () => {
@@ -183,6 +246,9 @@ const generateComparisonPdf = async (docs, comparison) => {
   if (comparison.total_annual_premium) finData.push(['Current Total Premium', comparison.total_annual_premium]);
   if (comparison.financial_optimization?.optimal_premium_estimate) finData.push(['Optimal Premium', comparison.financial_optimization.optimal_premium_estimate]);
   if (comparison.financial_optimization?.potential_savings) finData.push(['Potential Savings', comparison.financial_optimization.potential_savings]);
+  if (comparison.financial_optimization?.savings_note && !comparison.financial_optimization?.potential_savings) {
+    finData.push(['On Savings Estimates', comparison.financial_optimization.savings_note]);
+  }
   if (comparison.financial_optimization?.efficiency_score) finData.push(['Efficiency Score', comparison.financial_optimization.efficiency_score]);
 
   if (finData.length) {
@@ -300,7 +366,7 @@ const generateComparisonPdf = async (docs, comparison) => {
     pdf.setTextColor(...primaryColor);
     pdf.setFontSize(13);
     pdf.setFont('helvetica', 'bold');
-    pdf.text('Recommendation: Keep, Review, or Cancel', margin, y);
+    pdf.text('Per-Policy Verdict', margin, y);
     y += 10;
 
     const verdictData = comparison.keep_cancel_ranking.map(r => {
@@ -464,6 +530,12 @@ const generatePdfReport = async (doc, analysis) => {
     if (coverage?.riders_and_additions?.length || coverage?.riders_add_ons?.length) {
       (coverage.riders_and_additions || coverage.riders_add_ons).forEach(item => tableData.push(['Rider/Add-on', item]));
     }
+    if (coverage?.sub_limits?.length) {
+      coverage.sub_limits.forEach(item => tableData.push(['Sub-limit', item]));
+    }
+    if (coverage?.deductible_or_excess) {
+      tableData.push(['Deductible / Excess', coverage.deductible_or_excess]);
+    }
     if (coverage?.total_coverage_value) {
       tableData.push(['Total Coverage', coverage.total_coverage_value]);
     }
@@ -503,11 +575,24 @@ const generatePdfReport = async (doc, analysis) => {
     if (exclusions.limitations?.length) {
       exclusions.limitations.forEach(l => warnData.push(['Limitation', l]));
     }
-    if (exclusions.red_flags?.length) {
-      exclusions.red_flags.forEach(r => warnData.push(['Red Flag', r]));
+    if (exclusions.pre_existing_conditions) {
+      warnData.push(['Pre-Existing', exclusions.pre_existing_conditions]);
     }
     if (exclusions.waiting_periods?.length) {
       exclusions.waiting_periods.forEach(w => warnData.push(['Waiting Period', w]));
+    }
+    // red_flags carries objects now (severity / issue / why_it_matters /
+    // evidence); older responses returned plain strings, so handle both.
+    const redFlags = exclusions.red_flags || analysis.red_flags;
+    if (redFlags?.length) {
+      redFlags.forEach(r => {
+        if (typeof r === 'string') {
+          warnData.push(['Red Flag', r]);
+        } else if (r) {
+          const detail = [r.issue, r.why_it_matters].filter(Boolean).join(' — ');
+          warnData.push([`Red Flag (${r.severity || 'Note'})`, detail || '']);
+        }
+      });
     }
 
     if (warnData.length) {
@@ -524,6 +609,50 @@ const generatePdfReport = async (doc, analysis) => {
       });
       y = pdf.lastAutoTable.finalY + 10;
     }
+  }
+
+  // Not Found In This Document — the section that keeps a partial upload from
+  // reading as a clean bill of health.
+  if (analysis.not_found_in_document?.length) {
+    if (y > 220) { pdf.addPage(); y = 20; }
+    pdf.setTextColor(100, 116, 139);
+    pdf.setFontSize(14);
+    pdf.setFont('helvetica', 'bold');
+    pdf.text('Not Found In This Document', margin, y);
+    y += 10;
+    autoTable(pdf, {
+      startY: y,
+      margin: { left: margin, right: margin },
+      head: [['Looked for, not present in the text provided']],
+      body: analysis.not_found_in_document.map(item => [item]),
+      theme: 'grid',
+      headStyles: { fillColor: [100, 116, 139], textColor: 255, fontSize: 10 },
+      bodyStyles: { fontSize: 9, textColor: [55, 65, 81] },
+      alternateRowStyles: { fillColor: [248, 250, 252] },
+    });
+    y = pdf.lastAutoTable.finalY + 10;
+  }
+
+  // Questions For Your Agent
+  if (analysis.questions_for_your_agent?.length) {
+    if (y > 220) { pdf.addPage(); y = 20; }
+    pdf.setTextColor(16, 185, 129);
+    pdf.setFontSize(14);
+    pdf.setFont('helvetica', 'bold');
+    pdf.text('Questions To Ask Your Agent', margin, y);
+    y += 10;
+    autoTable(pdf, {
+      startY: y,
+      margin: { left: margin, right: margin },
+      head: [['#', 'Question']],
+      body: analysis.questions_for_your_agent.map((q, i) => [String(i + 1), q]),
+      theme: 'grid',
+      headStyles: { fillColor: [16, 185, 129], textColor: 255, fontSize: 10 },
+      bodyStyles: { fontSize: 9, textColor: [55, 65, 81] },
+      columnStyles: { 0: { cellWidth: 10, fontStyle: 'bold' } },
+      alternateRowStyles: { fillColor: [240, 253, 244] },
+    });
+    y = pdf.lastAutoTable.finalY + 10;
   }
 
   // Financial Analysis
@@ -613,6 +742,11 @@ function Home() {
   const [showUpload, setShowUpload] = useState(false);
   const [comparisonResult, setComparisonResult] = useState(null);
   const [pdfGenerating, setPdfGenerating] = useState(false);
+  // idle | starting | generating | ready | error
+  const [report, setReport] = useState({ status: 'idle', error: '', data: null, mode: null, sessionId: null });
+  // Whether reports are sold or given away. The server decides, from whether
+  // payment is configured; the page just asks.
+  const [paidReports, setPaidReports] = useState(false);
   const fileInputRefs = useRef({});
 
   const updateDoc = (id, updates) => {
@@ -642,7 +776,7 @@ function Home() {
         loadingTask.promise.then(pdf => {
           clearTimeout(timeoutId);
           let fullText = '';
-          const maxPages = Math.min(pdf.numPages, 20);
+          const maxPages = Math.min(pdf.numPages, MAX_PDF_PAGES);
 
           const extractPages = async () => {
             try {
@@ -690,7 +824,7 @@ function Home() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
-        body: JSON.stringify({ text })
+        body: JSON.stringify({ text, fileName: documents.find(d => d.id === id)?.file?.name || null })
       });
 
       clearTimeout(timeoutId);
@@ -714,143 +848,174 @@ function Home() {
     }
   };
 
-  const runExecutiveAnalysis = async (id) => {
-    const doc = documents.find(d => d.id === id);
-    if (!doc?.extractedText || doc.extractedText.length < 50) {
-      updateDoc(id, { error: 'No text available for analysis.' });
-      return;
-    }
+  /** Documents with enough text to be worth putting in a report. */
+  const reportableDocs = documents
+    .filter(d => d.extractedText && d.extractedText.length >= 50)
+    .slice(0, MAX_REPORT_DOCS)
+    .map((d, i) => ({
+      name: d.file?.name?.replace(/\.[^/.]+$/, '') || `Policy ${i + 1}`,
+      text: d.extractedText
+    }));
 
-    const providers = [
-      { name: 'Agnes AI', key: 'agnes' },
-      { name: 'Agnes AI (retry)', key: 'agnes' },
-      { name: 'Kimi AI', key: 'kimi' },
-      { name: 'Kimi AI (retry)', key: 'kimi' }
-    ];
-
-    for (let i = 0; i < providers.length; i++) {
-      const provider = providers[i];
-      updateDoc(id, {
-        loading: true,
-        error: '',
-        stage: 'executive_analysis',
-        stageMessage: `Analyzing with ${provider.name}...`
-      });
-
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 25000);
-
-      try {
-        const res = await fetch('/api/analyze-fallback', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: controller.signal,
-          body: JSON.stringify({
-            text: doc.extractedText,
-            mode: 'executive',
-            provider: provider.key
-          })
-        });
-
-        clearTimeout(timeoutId);
-        const data = await res.json();
-
-        if (!data.error) {
-          updateDoc(id, { loading: false, stage: null, stageMessage: null });
-          setPdfGenerating(true);
-          try {
-            await generatePdfReport(doc, data.analysis);
-          } finally {
-            setPdfGenerating(false);
-          }
-          return;
-        }
-
-        if (data.retry && i < providers.length - 1) {
-          updateDoc(id, {
-            stageMessage: `${provider.name} busy. Waiting 10s before retry...`,
-            loading: true
-          });
-          await new Promise(r => setTimeout(r, 10000));
-          continue;
-        }
-
-        throw new Error(data.error || 'All providers failed');
-
-      } catch (err) {
-        clearTimeout(timeoutId);
-
-        if (err.name === 'AbortError') {
-          if (i < providers.length - 1) {
-            updateDoc(id, {
-              stageMessage: `${provider.name} timed out. Waiting 10s before retry...`,
-              loading: true
-            });
-            await new Promise(r => setTimeout(r, 10000));
-            continue;
-          }
-        }
-
-        if (i < providers.length - 1) {
-          updateDoc(id, {
-            stageMessage: `${provider.name} error. Waiting 10s before retry...`,
-            loading: true
-          });
-          await new Promise(r => setTimeout(r, 10000));
-          continue;
-        }
-
-        updateDoc(id, {
-          error: 'All AI providers are currently busy. Please try again in a few minutes.',
-          loading: false,
-          stage: null,
-          stageMessage: null
-        });
-        return;
+  /** Renders the PDF from a report already in hand. Costs nothing to repeat. */
+  const downloadReportPdf = useCallback(async (payload) => {
+    if (!payload) return;
+    setPdfGenerating(true);
+    try {
+      if (payload.mode === 'compare' && payload.comparison) {
+        const docs = (payload.documents || []).map(d => ({ file: { name: d.name } }));
+        await generateComparisonPdf(docs, payload.comparison);
+      } else if (payload.analysis) {
+        const name = payload.documents?.[0]?.name || 'policy';
+        await generatePdfReport({ file: { name } }, payload.analysis);
       }
+    } catch (err) {
+      console.error('PDF generation failed:', err);
+      setReport(prev => ({ ...prev, error: 'The report was generated but the PDF failed to build. Try Download again.' }));
+    } finally {
+      setPdfGenerating(false);
     }
-  };
+  }, []);
 
-  const runComparison = async () => {
-    const analyzedDocs = documents.filter(d => d.analysis && !d.analysis.raw && d.file);
-    if (analyzedDocs.length < 2) {
-      alert('Please analyze at least 2 policies to compare.');
-      return;
-    }
-
-    updateDoc(analyzedDocs[0].id, { loading: true, error: '', stage: 'comparison' });
+  /** Generates the report directly, with nothing to pay. */
+  const requestFreeReport = async () => {
+    if (!reportableDocs.length) return;
+    setReport({ status: 'generating', error: '', data: null, mode: null, sessionId: null });
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 55000);
+    const timeoutId = setTimeout(() => controller.abort(), 58000);
 
     try {
-      const res = await fetch('/api/analyze-compare', {
+      const res = await fetch('/api/report', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
-        body: JSON.stringify({
-          documents: analyzedDocs.map(d => ({
-            name: d.file.name.replace(/\.[^/.]+$/, ''),
-            text: d.extractedText
-          }))
-        })
+        body: JSON.stringify({ documents: reportableDocs })
       });
+      clearTimeout(timeoutId);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'The report could not be generated.');
 
+      const payload = { ...data, documents: reportableDocs.map(d => ({ name: d.name })) };
+      setReport({ status: 'ready', error: '', data: payload, mode: payload.mode, sessionId: null });
+      if (payload.mode === 'compare' && payload.comparison) setComparisonResult(payload.comparison);
+      downloadReportPdf(payload);
+    } catch (err) {
+      clearTimeout(timeoutId);
+      setReport({
+        status: 'error',
+        error: err.name === 'AbortError'
+          ? 'That took longer than expected. Please try again.'
+          : (err.message || 'The report could not be generated.'),
+        data: null, mode: null, sessionId: null
+      });
+    }
+  };
+
+  /** Sends the browser to Stripe, leaving the document text behind in the tab. */
+  const startCheckout = async () => {
+    if (!reportableDocs.length) return;
+    setReport({ status: 'starting', error: '', data: null, mode: null, sessionId: null });
+
+    if (!stashPendingDocs(reportableDocs)) {
+      setReport({ status: 'error', error: 'Your browser blocked local storage, which this needs to hold your documents during payment. Try turning off private browsing.', data: null, mode: null, sessionId: null });
+      return;
+    }
+
+    try {
+      const res = await fetch('/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ documentCount: reportableDocs.length })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.url) throw new Error(data.error || 'Could not start checkout.');
+      window.location.href = data.url;
+    } catch (err) {
+      setReport({ status: 'error', error: err.message || 'Could not start checkout.', data: null, mode: null, sessionId: null });
+    }
+  };
+
+  /** The one thing the report button does, whichever world we are in. */
+  const requestReport = () => (paidReports ? startCheckout() : requestFreeReport());
+
+  /** Asks the server for the report once Stripe has confirmed the payment. */
+  const generateReport = useCallback(async (sessionId) => {
+    const cached = readCachedReport(sessionId);
+    if (cached) {
+      setReport({ status: 'ready', error: '', data: cached, mode: cached.mode, sessionId });
+      if (cached.mode === 'compare' && cached.comparison) setComparisonResult(cached.comparison);
+      return;
+    }
+
+    const pending = readPendingDocs();
+    if (!pending?.length) {
+      setReport({
+        status: 'error',
+        sessionId,
+        mode: null,
+        data: null,
+        error: 'Your payment went through, but this browser no longer has the documents. Re-upload them in this tab and your report will generate without charging you again.'
+      });
+      return;
+    }
+
+    setReport({ status: 'generating', error: '', data: null, mode: null, sessionId });
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 58000);
+
+    try {
+      const res = await fetch('/api/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({ sessionId, documents: pending })
+      });
       clearTimeout(timeoutId);
       const data = await res.json();
 
-      if (data.error) {
-        updateDoc(analyzedDocs[0].id, { error: data.error, loading: false, stage: null });
-      } else {
-        updateDoc(analyzedDocs[0].id, { loading: false, stage: null });
-        setComparisonResult(data.comparison);
-        setTimeout(() => document.getElementById('comparison-results')?.scrollIntoView({ behavior: 'smooth' }), 300);
+      if (!res.ok) {
+        throw new Error(data.error || 'The report could not be generated.');
       }
+
+      const payload = { ...data, documents: pending.map(d => ({ name: d.name })) };
+      cacheReport(sessionId, payload);
+      clearPendingDocs();
+
+      setReport({ status: 'ready', error: '', data: payload, mode: payload.mode, sessionId });
+      if (payload.mode === 'compare' && payload.comparison) setComparisonResult(payload.comparison);
+      downloadReportPdf(payload);
+
     } catch (err) {
       clearTimeout(timeoutId);
-      updateDoc(analyzedDocs[0].id, { error: err.message || 'Comparison failed', loading: false, stage: null });
+      const message = err.name === 'AbortError'
+        ? 'That took longer than expected. Your payment is safe — reload this page to try again.'
+        : (err.message || 'The report could not be generated.');
+      setReport({ status: 'error', error: message, data: null, mode: null, sessionId });
     }
-  };
+  }, [downloadReportPdf]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    fetch('/api/config')
+      .then(r => r.json())
+      .then(cfg => { if (!cancelled) setPaidReports(Boolean(cfg.paidReports)); })
+      .catch(() => { /* stay on the free wording */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Coming back from Stripe: ?report=<checkout session id>
+  React.useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const sessionId = params.get('report');
+    if (!sessionId) return;
+
+    // Clear the id out of the address bar so a refresh does not re-trigger it.
+    window.history.replaceState({}, '', window.location.pathname);
+    generateReport(sessionId);
+    setTimeout(() => document.getElementById('report-section')?.scrollIntoView({ behavior: 'smooth' }), 400);
+  }, [generateReport]);
 
   const processFileForDoc = async (selectedFile, id, providedPassword = null) => {
     if (!selectedFile) return;
@@ -937,7 +1102,7 @@ function Home() {
         return;
       }
 
-      updateDoc(id, { extractedText: text.substring(0, 5000), needsPassword: false, pendingBuffer: null, stage: 'analyzing', extractProgress: null });
+      updateDoc(id, { extractedText: text.substring(0, MAX_RETAINED_CHARS), needsPassword: false, pendingBuffer: null, stage: 'analyzing', extractProgress: null });
       await analyzeDocText(text, id);
 
     } catch (err) {
@@ -974,7 +1139,7 @@ function Home() {
         return;
       }
 
-      updateDoc(id, { extractedText: text.substring(0, 5000), pendingBuffer: null, stage: 'analyzing', extractProgress: null });
+      updateDoc(id, { extractedText: text.substring(0, MAX_RETAINED_CHARS), pendingBuffer: null, stage: 'analyzing', extractProgress: null });
       await analyzeDocText(text, id);
     } catch (err) {
       if (err.message === 'PASSWORD_REQUIRED') {
@@ -1203,7 +1368,6 @@ function Home() {
     URL.revokeObjectURL(url);
   };
 
-  const analyzedCount = documents.filter(d => d.analysis && !d.analysis.raw).length;
 
   return (
     <div className="min-h-screen bg-white text-slate-800">
@@ -1321,14 +1485,28 @@ function Home() {
           <div className="flex items-center gap-2 sm:gap-4">
             <a href="#how-it-works" className="hidden sm:inline-flex text-sm text-slate-500 hover:text-slate-800 transition-colors font-medium">How It Works</a>
             <a href="#upload-section" className="hidden sm:inline-flex text-sm text-slate-500 hover:text-slate-800 transition-colors font-medium">Analyze</a>
-            {analyzedCount > 0 && (
+            {reportableDocs.length > 0 && report.status !== 'ready' && (
               <button
-                onClick={() => {
-                  const analyzedDoc = documents.find(d => d.analysis && !d.analysis.raw);
-                  if (analyzedDoc) runExecutiveAnalysis(analyzedDoc.id);
-                }}
+                onClick={requestReport}
+                disabled={report.status === 'starting' || report.status === 'generating'}
+                className="inline-flex items-center gap-1 sm:gap-2 px-2.5 sm:px-3.5 py-1.5 sm:py-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white rounded-lg text-xs sm:text-sm font-medium transition-colors shadow-sm"
+              >
+                {report.status === 'starting' || report.status === 'generating' ? (
+                  <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                ) : (
+                  <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                )}
+                <span className="hidden sm:inline">Get full report{paidReports ? ` \u00b7 ${REPORT_PRICE}` : ''}</span>
+                <span className="sm:hidden">Report</span>
+              </button>
+            )}
+            {report.status === 'ready' && (
+              <button
+                onClick={() => downloadReportPdf(report.data)}
                 disabled={pdfGenerating}
-                className="inline-flex items-center gap-1 sm:gap-2 px-2 sm:px-3.5 py-1.5 sm:py-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white rounded-lg text-xs sm:text-sm font-medium transition-colors shadow-sm"
+                className="inline-flex items-center gap-1 sm:gap-2 px-2.5 sm:px-3.5 py-1.5 sm:py-2 bg-slate-800 hover:bg-slate-900 disabled:bg-slate-500 text-white rounded-lg text-xs sm:text-sm font-medium transition-colors shadow-sm"
               >
                 {pdfGenerating ? (
                   <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
@@ -1337,25 +1515,8 @@ function Home() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
                 )}
-                <span className="hidden sm:inline">Export PDF</span>
+                <span className="hidden sm:inline">Download PDF</span>
                 <span className="sm:hidden">PDF</span>
-              </button>
-            )}
-            {analyzedCount >= 2 && (
-              <button
-                onClick={runComparison}
-                disabled={pdfGenerating}
-                className="inline-flex items-center gap-1 sm:gap-2 px-2 sm:px-3.5 py-1.5 sm:py-2 bg-amber-500 hover:bg-amber-600 disabled:bg-amber-300 text-white rounded-lg text-xs sm:text-sm font-medium transition-colors shadow-sm"
-              >
-                {pdfGenerating ? (
-                  <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                ) : (
-                  <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m6 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                  </svg>
-                )}
-                <span className="hidden sm:inline">Compare & Export</span>
-                <span className="sm:hidden">Compare</span>
               </button>
             )}
           </div>
@@ -1616,17 +1777,6 @@ function Home() {
                     )}
                   </div>
                   <div className="flex items-center gap-2">
-                    {doc.analysis && !doc.analysis.raw && (
-                      <button
-                        onClick={() => runExecutiveAnalysis(doc.id)}
-                        className="p-2 text-emerald-500 hover:text-emerald-700 transition-colors"
-                        title="Export PDF Report"
-                      >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                        </svg>
-                      </button>
-                    )}
                     <button
                       onClick={() => removeDocument(doc.id)}
                       className="p-2 text-slate-400 hover:text-red-500 transition-colors"
@@ -1798,6 +1948,118 @@ function Home() {
         </div>
 
         {/* Comparison Results */}
+        {/* The paid report: the offer, the progress, and the finished thing. */}
+        {(reportableDocs.length > 0 || report.status !== 'idle') && (
+          <div id="report-section" className="max-w-4xl mx-auto px-4 sm:px-6 mt-10">
+
+            {report.status === 'idle' && reportableDocs.length > 0 && (
+              <div className="bg-white border border-emerald-200 rounded-xl overflow-hidden shadow-sm">
+                <div className="p-6 sm:p-7">
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div>
+                      <h2 className="text-xl font-bold text-slate-900">
+                        {reportableDocs.length > 1
+                          ? `One combined report across your ${reportableDocs.length} policies`
+                          : 'Your full policy report'}
+                      </h2>
+                      <p className="text-sm text-slate-500 mt-1">
+                        The summaries above read the opening pages. The report reads the whole wording.
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-2xl font-bold text-slate-900">{paidReports ? REPORT_PRICE : 'Free'}</div>
+                      <div className="text-xs text-slate-500">{paidReports ? 'one-off \u00b7 no account' : 'no signup'}</div>
+                    </div>
+                  </div>
+
+                  <ul className="mt-5 grid sm:grid-cols-2 gap-x-6 gap-y-2 text-sm text-slate-600">
+                    <li className="flex gap-2"><span className="text-emerald-500">&#10003;</span> Reads the full policy wording, not the first few pages</li>
+                    <li className="flex gap-2"><span className="text-emerald-500">&#10003;</span> Every policy assessed together in one report</li>
+                    <li className="flex gap-2"><span className="text-emerald-500">&#10003;</span> Red flags ranked by severity, each with a quote from your document</li>
+                    <li className="flex gap-2"><span className="text-emerald-500">&#10003;</span> Sub-limits, charges and waiting periods pulled out in full</li>
+                    <li className="flex gap-2"><span className="text-emerald-500">&#10003;</span> Overlap and gaps across the whole set</li>
+                    <li className="flex gap-2"><span className="text-emerald-500">&#10003;</span> PDF you can keep, print, or hand to your agent</li>
+                  </ul>
+
+                  <button
+                    onClick={requestReport}
+                    className="mt-6 w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-semibold transition-colors shadow-sm"
+                  >
+                    {paidReports ? `Get the report \u00b7 ${REPORT_PRICE}` : 'Get the report'}
+                  </button>
+                  <p className="text-xs text-slate-400 mt-3">
+                    {paidReports
+                      ? `Same price whether you upload one policy or ${MAX_REPORT_DOCS}. Your documents stay in this browser until you pay.`
+                      : `Covers up to ${MAX_REPORT_DOCS} policies in one report. Nothing is stored.`}
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {(report.status === 'starting' || report.status === 'generating') && (
+              <div className="bg-white border border-slate-200 rounded-xl p-6 flex items-center gap-4">
+                <div className="w-5 h-5 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin shrink-0" />
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">
+                    {report.status === 'starting' ? 'Taking you to checkout\u2026' : 'Reading your policies in full\u2026'}
+                  </p>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    {report.status === 'starting'
+                      ? 'Your documents stay in this browser.'
+                      : 'This takes up to a minute. Please keep this tab open.'}
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {report.status === 'ready' && (
+              <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-6">
+                <div className="flex flex-wrap items-center justify-between gap-4">
+                  <div>
+                    <h2 className="text-lg font-bold text-slate-900">Your report is ready</h2>
+                    <p className="text-sm text-slate-600 mt-0.5">
+                      {report.data?.meta?.documents > 1
+                        ? `${report.data.meta.documents} policies, read in full and assessed together.`
+                        : 'Read in full and assessed.'}
+                      {report.data?.meta?.truncated && ' Very long sections were condensed \u2014 the report says where.'}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => downloadReportPdf(report.data)}
+                    disabled={pdfGenerating}
+                    className="inline-flex items-center gap-2 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white rounded-lg text-sm font-semibold transition-colors shadow-sm"
+                  >
+                    {pdfGenerating ? 'Building PDF\u2026' : 'Download PDF'}
+                  </button>
+                </div>
+                <p className="text-xs text-slate-500 mt-3">
+                  {paidReports
+                    ? 'Saved in this browser \u2014 you can download it again any time without paying twice.'
+                    : 'Download it as many times as you like.'}
+                </p>
+              </div>
+            )}
+
+            {report.status === 'error' && (
+              <div className="bg-red-50 border border-red-200 rounded-xl p-6">
+                <h2 className="text-sm font-semibold text-red-800">Something went wrong</h2>
+                <p className="text-sm text-red-700 mt-1">{report.error}</p>
+                {report.sessionId && (
+                  <p className="text-xs text-red-500 mt-3">
+                    Payment reference: <span className="font-mono">{report.sessionId}</span> \u2014 quote this if you contact us.
+                  </p>
+                )}
+                <button
+                  onClick={() => setReport({ status: 'idle', error: '', data: null, mode: null, sessionId: null })}
+                  className="mt-4 text-sm text-red-700 underline hover:text-red-900"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         {comparisonResult && (
           <div className="max-w-4xl mx-auto px-4 sm:px-6 mt-8">
             <div className="flex items-center justify-between mb-4">
@@ -1813,12 +2075,7 @@ function Home() {
               comparison={comparisonResult}
               docs={documents.filter(d => d.analysis && !d.analysis.raw)}
               pdfGenerating={pdfGenerating}
-              onExportPdf={() => {
-                const analyzedDocs = documents.filter(d => d.analysis && !d.analysis.raw && d.file);
-                if (analyzedDocs.length < 2) return;
-                setPdfGenerating(true);
-                generateComparisonPdf(analyzedDocs, comparisonResult).finally(() => setPdfGenerating(false));
-              }}
+              onExportPdf={() => downloadReportPdf(report.data)}
             />
           </div>
         )}
@@ -2164,20 +2421,93 @@ function AnalysisResults({ analysis }) {
         </div>
       )}
 
-      {/* Warnings */}
-      {analysis.warnings_and_gaps?.length > 0 && (
+      {/* Warnings. The model returns these under `warnings`; `warnings_and_gaps`
+          was the key this block used to read, which no prompt ever produced, so
+          the section never rendered. Accept both. */}
+      {(analysis.warnings_and_gaps?.length > 0 || analysis.warnings?.length > 0) && (
         <div className="bg-amber-50 border border-amber-200 rounded-xl p-5">
           <h3 className="text-sm font-semibold text-amber-800 mb-3 flex items-center gap-2">
             <svg className="w-4 h-4 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
             </svg>
-            ⚠️ Warnings & Gaps
+            Warnings & Gaps
           </h3>
           <ul className="space-y-1.5 text-sm text-amber-800 list-disc list-inside">
-            {analysis.warnings_and_gaps.map((item, i) => (
+            {(analysis.warnings_and_gaps || analysis.warnings).map((item, i) => (
+              <li key={i}>{typeof item === 'string' ? item : item?.issue || ''}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Red flags, ranked by what they cost at claim time. */}
+      {analysis.red_flags?.length > 0 && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-5">
+          <h3 className="text-sm font-semibold text-red-800 mb-3">Red Flags</h3>
+          <ul className="space-y-3">
+            {analysis.red_flags.map((flag, i) => (
+              <li key={i} className="text-sm">
+                <div className="flex items-start gap-2">
+                  <span className={`shrink-0 mt-0.5 px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wide ${
+                    flag?.severity === 'High' ? 'bg-red-600 text-white'
+                      : flag?.severity === 'Medium' ? 'bg-amber-500 text-white'
+                      : 'bg-slate-400 text-white'
+                  }`}>
+                    {flag?.severity || 'Note'}
+                  </span>
+                  <div>
+                    <p className="text-slate-900 font-medium">{flag?.issue}</p>
+                    {flag?.why_it_matters && (
+                      <p className="text-slate-600 mt-0.5">{flag.why_it_matters}</p>
+                    )}
+                    {flag?.evidence && (
+                      <p className="text-slate-500 italic mt-0.5 text-xs">&ldquo;{flag.evidence}&rdquo;</p>
+                    )}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* What the document does not say. Distinct from what it excludes. */}
+      {analysis.not_found_in_document?.length > 0 && (
+        <div className="bg-slate-50 border border-slate-200 rounded-xl p-5">
+          <h3 className="text-sm font-semibold text-slate-800 mb-1">Not Found In This Document</h3>
+          <p className="text-xs text-slate-500 mb-3">
+            These were looked for and not found in the text provided. That is not the same as being excluded &mdash; they may sit in wording that was not uploaded.
+          </p>
+          <ul className="space-y-1.5 text-sm text-slate-700 list-disc list-inside">
+            {analysis.not_found_in_document.map((item, i) => (
               <li key={i}>{item}</li>
             ))}
           </ul>
+        </div>
+      )}
+
+      {/* The gaps above, turned into something the reader can act on. */}
+      {analysis.questions_for_your_agent?.length > 0 && (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-5">
+          <h3 className="text-sm font-semibold text-emerald-800 mb-3">Questions To Ask Your Agent</h3>
+          <ol className="space-y-1.5 text-sm text-emerald-900 list-decimal list-inside">
+            {analysis.questions_for_your_agent.map((q, i) => (
+              <li key={i}>{q}</li>
+            ))}
+          </ol>
+        </div>
+      )}
+
+      {/* Says plainly what was read, so a partial upload is never mistaken for a full review. */}
+      {analysis.document_assessment && (
+        <div className="border border-slate-200 rounded-xl p-4 text-xs text-slate-500">
+          <span className="font-semibold text-slate-600">Document read:</span>{' '}
+          {analysis.document_assessment.document_kind || 'Unclear'}
+          {analysis.document_assessment.completeness && ` \u00b7 ${analysis.document_assessment.completeness}`}
+          {analysis.document_assessment.confidence && ` \u00b7 Confidence: ${analysis.document_assessment.confidence}`}
+          {analysis.document_assessment.completeness_note && (
+            <p className="mt-1">{analysis.document_assessment.completeness_note}</p>
+          )}
         </div>
       )}
     </div>
@@ -2241,6 +2571,11 @@ function ComparisonResults({ comparison, docs, onExportPdf, pdfGenerating }) {
             <div className="bg-white border border-slate-200 rounded-xl p-4 text-center">
               <p className="text-xs text-slate-500 mb-1">Optimal Premium</p>
               <p className="text-lg font-bold text-emerald-600">{comparison.financial_optimization.optimal_premium_estimate}</p>
+            </div>
+          )}
+          {comparison.financial_optimization?.savings_note && !comparison.financial_optimization?.potential_savings && (
+            <div className="sm:col-span-2">
+              <p className="text-xs text-slate-500">{comparison.financial_optimization.savings_note}</p>
             </div>
           )}
           {comparison.financial_optimization?.potential_savings && (
@@ -2345,14 +2680,14 @@ function ComparisonResults({ comparison, docs, onExportPdf, pdfGenerating }) {
         </div>
       )}
 
-      {/* Keep / Cancel / Review */}
+      {/* Per-policy verdict */}
       {comparison.keep_cancel_ranking?.length > 0 && (
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           <h3 className="text-sm font-semibold text-slate-800 p-4 border-b border-slate-100 flex items-center gap-2">
             <svg className="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
-            Recommendation: Keep, Review, or Cancel
+            Per-Policy Verdict
           </h3>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">

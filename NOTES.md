@@ -6,10 +6,27 @@
 
 ## What This Is
 
-AI-powered insurance document summarizer. Two-tier:
-- **Free**: Quick summary via `/api/analyze` (agnes-1.5-flash, 55s timeout)
-- **Premium**: Executive PDF report via `/api/analyze-fallback` (agnes-1.5-pro, 25s per attempt, 4 retries with 10s backoff)
-- **Endgame**: Multi-policy comparison via `/api/analyze-compare` (analyzes 2+ docs together, generates consolidated comparison PDF)
+AI-powered insurance document summarizer.
+
+- **Per-policy summary** on screen via `/api/analyze` (agnes-3.0-flash). 3 per IP per day.
+- **The report** — 1-5 policies read in full and assessed together, as one PDF, via `/api/report`.
+
+**The report is free or paid depending on configuration, with no flag to set.**
+`paidReportsEnabled()` in `lib/tiers.js` returns true only when both
+`STRIPE_SECRET_KEY` and `ANTHROPIC_API_KEY` are present:
+
+| Keys | Report costs | Runs on | Metered by |
+|------|--------------|---------|-----------|
+| Neither | Free | `agnes-3.0-flash` | 2 per IP per day |
+| Both | S$4.90 | `claude-haiku-4-5` | Stripe payment |
+
+Adding the two keys in Vercel is the whole of "turn on payments" — no deploy,
+no code change. `/api/config` tells the page which world it is in so the button
+says the right thing before anyone clicks it.
+
+**The product is the report.** Priced per report, not per policy — one price whether
+you upload one policy or five. Charging per policy would tax the exact behaviour
+that makes this useful: putting a household's whole set in front of the model at once.
 
 Domain: **policy2summary.com**
 Repo: **jpmoregain-eth/policy2summary**
@@ -28,16 +45,48 @@ Repo: **jpmoregain-eth/policy2summary**
 - Supports up to 5 documents simultaneously
 
 ### API Routes
-| Route | Purpose | Model | Timeout |
-|-------|---------|-------|---------|
-| `/api/analyze` | Free quick summary | agnes-1.5-flash | 55s |
-| `/api/analyze-fallback` | Premium executive PDF | agnes-1.5-pro | 25s per attempt |
-| `/api/analyze-compare` | Multi-policy comparison | agnes-1.5-pro | 55s |
+| Route | Purpose | Model | Paid? |
+|-------|---------|-------|-------|
+| `/api/analyze` | Free per-policy summary, rate limited | agnes-3.0-flash | No |
+| `/api/analyze-fallback` | Free summary, alternate provider | agnes-3.0-flash / kimi-k2.6 | No |
+| `/api/checkout` | Creates a Stripe Checkout session | — | — |
+| `/api/config` | Tells the page whether reports are paid | — | — |
+| `/api/report` | The combined report | haiku-4-5 or agnes-3.0-flash | **When configured** |
+| `/api/analyze-compare` | Retired stub, returns 402 | — | — |
+
+Every route exports `config = { maxDuration: 60 }` — without it Vercel applied
+its default limit regardless of the Pro plan.
+
+### The paywall
+
+Executive and comparison analysis are the paid product, so **every free route
+returns 402 for those modes**. `/api/analyze-claude` was deleted outright: it
+read the tier from the request body, which meant the caller could simply declare
+itself paid. Entitlement now comes from Stripe and nowhere else.
 
 ### Environment Variables (Vercel)
 ```
-AGNES_API_KEY=<key>    # Required for all AI calls
-KIMI_API_KEY=<key>     # Fallback provider (optional)
+AGNES_API_KEY=<key>          # Free tier summaries
+KIMI_API_KEY=<key>           # Fallback provider (optional)
+
+# Model ids are env vars, not code. Agnes has retired a model three times;
+# the next one should be a Vercel setting, not a deploy.
+AGNES_MODEL=agnes-3.0-flash  # optional, this is the default
+AGNES_BASE_URL=https://apihub.agnes-ai.com/v1   # optional
+KIMI_MODEL=kimi-k2.6         # optional
+
+# Setting BOTH of these switches reports from free to paid. Setting neither
+# leaves reports free, running on Agnes. Do not set only one.
+ANTHROPIC_API_KEY=<key>      # Paid reports only — spent only when revenue arrives
+STRIPE_SECRET_KEY=<key>      # Enables /api/checkout
+NEXT_PUBLIC_SITE_URL=https://policy2summary.com   # Stripe return URLs
+
+# Shared state for rate limiting and payment redemption. WITHOUT THESE THE
+# FREE-TIER LIMIT DOES NOT HOLD — each Vercel instance counts separately.
+KV_REST_API_URL=<upstash url>
+KV_REST_API_TOKEN=<upstash token>
+
+ANALYZE_CONTEXT_CHARS=30000  # optional
 ```
 - **NEVER hardcode API keys in source** — GitHub push protection will block commits containing keys
 - Kimi endpoint: `https://api.moonshot.ai/v1` (NOT apihub.agnes-ai.com)
@@ -244,10 +293,9 @@ try {
 
 | Feature | Model | Why |
 |---------|-------|-----|
-| Free summary | `agnes-1.5-flash` | Fast, cheap, good enough for basic extraction |
-| Executive PDF | `agnes-1.5-pro` | Higher quality, deeper analysis for paid tier |
-| Comparison | `agnes-1.5-pro` | Complex multi-doc reasoning needs pro |
-| Fallback | `kimi` (moonshot) | Backup when Agnes is rate-limited |
+| Free summary | `agnes-3.0-flash` | Already paid for. Keeps the Anthropic credit for paying customers |
+| Fallback | `kimi-k2.6` (moonshot) | Backup when Agnes is rate-limited |
+| Paid report | `claude-haiku-4-5` | 200K context reads a whole policy wording; ~6 cents per report |
 
 ---
 
@@ -255,11 +303,70 @@ try {
 
 | File | Purpose |
 |------|---------|
-| `pages/index.js` | Main UI — 2000+ lines, be careful with large edits |
-| `pages/api/analyze.js` | Free summary endpoint |
-| `pages/api/analyze-fallback.js` | Premium executive endpoint |
-| `pages/api/analyze-compare.js` | Multi-policy comparison endpoint |
+| `pages/index.js` | Main UI — 2400+ lines, be careful with large edits |
+| `lib/prompts.js` | **Every analysis prompt lives here.** Single source of truth |
+| `lib/policy-text.js` | Signal-weighted condensation — keeps exclusions, drops boilerplate |
+| `lib/json-response.js` | Tolerant JSON parsing, including repair of truncated responses |
+| `lib/tiers.js` | Free vs paid-report definitions, including the price |
+| `lib/store.js` | Shared state over Upstash REST — rate limits and payment redemption |
+| `lib/providers.js` | Free-tier provider config. **Model ids live here, from env vars** |
+| `pages/api/analyze.js` | Quick summary endpoint |
+| `pages/api/analyze-fallback.js` | Executive endpoint with provider fallback |
+| `pages/api/analyze-compare.js` | Retired stub (402) |
+| `pages/api/checkout.js` | Stripe Checkout session |
+| `pages/api/report.js` | The paid report — verifies payment, then generates |
 | `public/googlef0b1253b37cd8c20.html` | Google Search Console verification |
+
+---
+
+## Prompt Design Rules
+
+`lib/prompts.js` is the whole prompt surface. Never paste prompt text into a
+route — the two copies that used to live in `analyze.js` and
+`analyze-fallback.js` had already drifted apart.
+
+Three rules do most of the work and should not be relaxed:
+
+1. **Missing means null.** A guessed policy number is worse than a blank one.
+2. **Absence is not exclusion.** The model must never write "this policy does
+   not cover X" when it means "X was not in the text I was given". Anything it
+   looked for and could not find goes into `not_found_in_document`.
+3. **No invented market pricing.** The model has no quotes, no competitor
+   rates and no underwriting data. `optimal_premium_estimate` and
+   `potential_savings` are deliberately hard-nulled in the comparison prompt —
+   a confident fake savings figure could push someone to cancel cover they
+   cannot be underwritten for again.
+
+`DOMAIN_CHECKLIST` is the quality lever. It tells the model where the money
+hides in an insurance contract — sub-limits, waiting periods, allocation rates,
+bid-offer spreads, incontestability windows. Extend it rather than rewriting
+the schemas.
+
+### Fields the prompts return
+
+Beyond the original keys (all preserved), responses now carry
+`document_assessment`, `not_found_in_document`, `questions_for_your_agent`,
+`red_flags` (objects with `severity` / `issue` / `why_it_matters` /
+`evidence`), `market_context`, and per-section `evidence` quotes. All are
+rendered on-page and in the executive PDF.
+
+---
+
+## How Much Of The Document Gets Read
+
+This was the single largest quality bug. The client capped `extractedText` at
+5,000 characters, so the executive report and the comparison — the deeper
+analyses — saw *less* of the policy than the free summary, which sent the full
+text and let the server truncate at 8,000. Both are gone.
+
+- Client keeps up to `MAX_RETAINED_CHARS` (200,000) and reads up to
+  `MAX_PDF_PAGES` (60) pages, up from 20.
+- The server decides the budget per mode and condenses with
+  `condensePolicyText`, which keeps the front matter whole and then spends the
+  rest of the budget on the highest-signal passages, in document order, marking
+  each cut with `[...]`.
+- Whenever text is dropped the model is told so explicitly, so a partial upload
+  is reported as partial rather than as a clean bill of health.
 
 ---
 
@@ -284,8 +391,78 @@ try {
 
 ---
 
-*Last updated: 2026-05-19 by GoldmanSax*
+*Last updated: 2026-09-02 — prompt overhaul, context-budget fixes, Claude Haiku tier route.*
 
 ## Contact
 - **Email:** thejpmoregainproject@gmail.com
 - **Added to footer:** 2026-05-20
+
+
+---
+
+## The Payment Flow
+
+No accounts, no database. The document text rides in the browser across the
+Stripe redirect, which means there is nothing to build and no policy text
+sitting on a server waiting to be breached.
+
+1. Visitor uploads 1-5 policies. Each gets a free on-screen summary (Agnes).
+2. They click **Get the report — S$4.90**. The extracted text goes into
+   `sessionStorage`; `/api/checkout` creates a Stripe session; the browser
+   redirects to Stripe.
+3. Stripe returns them to `/?report=<checkout_session_id>`.
+4. The page posts that id plus the stashed text to `/api/report`, which asks
+   Stripe whether the session is actually paid before doing any work.
+5. The finished report is cached in `localStorage`, so re-downloading the PDF
+   costs nothing and never touches the API again.
+
+### Two rules that must not be broken
+
+**Generate only after payment.** The expensive call sits on the far side of the
+paywall, so there is nothing to bypass and the Anthropic bill only moves when
+revenue does.
+
+**Release the claim when generation fails.** `/api/report` claims the payment
+before it starts work so two tabs cannot double-spend it — but every failure
+path calls `release()`. A customer whose report died on a transient API error
+has already paid and must be able to try again.
+
+### What is not yet handled
+
+- **Refunds are manual.** Errors surface the Stripe payment reference and ask
+  the customer to get in touch.
+- **A cleared browser loses the pending documents.** The payment is still
+  redeemable — re-uploading in the same browser regenerates the report without
+  a second charge — but if they clear storage entirely, that is a manual refund.
+- **No Stripe webhook.** Payment is verified by retrieving the session on
+  demand, which is sufficient for one-off purchases and needs no endpoint
+  secret. Add a webhook only if you move to subscriptions.
+
+
+---
+
+## Changing The Free-Tier Model
+
+Agnes has retired a model three times (1.5-pro, 1.5-flash, 2.0-flash), and each
+time it meant editing source and redeploying. It does not any more.
+
+`lib/providers.js` reads `AGNES_MODEL` and `AGNES_BASE_URL` from the
+environment, defaulting to `agnes-3.0-flash`. To move to the next model, change
+the Vercel environment variable and redeploy — no code change, and nothing to
+get wrong in two files.
+
+Current model, as of 2026-09-27: **`agnes-3.0-flash`**. OpenAI-compatible at
+`https://apihub.agnes-ai.com/v1/chat/completions`, very large context, and much
+cheaper than the model it replaces (roughly $0.05 per million input tokens and
+$0.15 per million output, against Haiku's $1 / $5).
+
+### The free context budget is now the cheap part
+
+At those rates a free summary at the current 30,000-character budget costs well
+under a tenth of a cent. `ANALYZE_CONTEXT_CHARS` could be raised a long way
+before cost mattered.
+
+It is deliberately left at 30,000 anyway, because it is a **pricing** decision
+rather than a cost one: "the report reads the whole wording, the free summary
+reads the opening pages" is the paid tier's main pitch. Raise it only if you
+decide the free tier should be more generous.
