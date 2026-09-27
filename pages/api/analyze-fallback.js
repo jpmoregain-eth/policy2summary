@@ -1,6 +1,7 @@
 import { standardPrompt, buildUserMessage } from '../../lib/prompts';
 import { condensePolicyText } from '../../lib/policy-text';
 import { parseModelJson } from '../../lib/json-response';
+import { getProvider } from '../../lib/providers';
 
 export const config = { maxDuration: 60 };
 
@@ -29,21 +30,8 @@ export default async function handler(req, res) {
       });
     }
 
-    const providers = {
-      agnes: {
-        apiKey: process.env.AGNES_API_KEY || '',
-        baseUrl: 'https://apihub.agnes-ai.com/v1',
-        model: 'agnes-1.5-flash'
-      },
-      kimi: {
-        apiKey: process.env.KIMI_API_KEY || '',
-        baseUrl: 'https://api.moonshot.ai/v1',
-        model: 'kimi-k2.6'
-      }
-    };
-
-    const providerConfig = providers[provider];
-    if (!providerConfig || !providerConfig.apiKey) {
+    const providerConfig = getProvider(provider);
+    if (!providerConfig || !providerConfig.apiKey()) {
       return res.status(500).json({ error: `${provider} API not configured` });
     }
 
@@ -54,7 +42,7 @@ export default async function handler(req, res) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${providerConfig.apiKey}`
+        'Authorization': `Bearer ${providerConfig.apiKey()}`
       },
       body: JSON.stringify({
         model: providerConfig.model,

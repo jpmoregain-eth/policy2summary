@@ -8,7 +8,7 @@
 
 AI-powered insurance document summarizer, with one paid product.
 
-- **Free**: per-policy summary on screen via `/api/analyze` (agnes-2.0-flash). 3 per IP per day. No PDF.
+- **Free**: per-policy summary on screen via `/api/analyze` (agnes-3.0-flash). 3 per IP per day. No PDF.
 - **Paid — the report**: `S$4.90` one-off. Upload 1-5 policies, pay, get one combined PDF. Runs on `claude-haiku-4-5` via `/api/report`.
 
 **The product is the report.** Priced per report, not per policy — one price whether
@@ -34,8 +34,8 @@ Repo: **jpmoregain-eth/policy2summary**
 ### API Routes
 | Route | Purpose | Model | Paid? |
 |-------|---------|-------|-------|
-| `/api/analyze` | Free per-policy summary, rate limited | agnes-2.0-flash | No |
-| `/api/analyze-fallback` | Free summary, alternate provider | agnes-1.5-flash / kimi-k2.6 | No |
+| `/api/analyze` | Free per-policy summary, rate limited | agnes-3.0-flash | No |
+| `/api/analyze-fallback` | Free summary, alternate provider | agnes-3.0-flash / kimi-k2.6 | No |
 | `/api/checkout` | Creates a Stripe Checkout session | — | — |
 | `/api/report` | The paid combined report | claude-haiku-4-5 | **Yes** |
 | `/api/analyze-compare` | Retired stub, returns 402 | — | — |
@@ -54,6 +54,12 @@ itself paid. Entitlement now comes from Stripe and nowhere else.
 ```
 AGNES_API_KEY=<key>          # Free tier summaries
 KIMI_API_KEY=<key>           # Fallback provider (optional)
+
+# Model ids are env vars, not code. Agnes has retired a model three times;
+# the next one should be a Vercel setting, not a deploy.
+AGNES_MODEL=agnes-3.0-flash  # optional, this is the default
+AGNES_BASE_URL=https://apihub.agnes-ai.com/v1   # optional
+KIMI_MODEL=kimi-k2.6         # optional
 
 ANTHROPIC_API_KEY=<key>      # Paid reports only — spent only when revenue arrives
 STRIPE_SECRET_KEY=<key>      # Enables /api/checkout and /api/report
@@ -271,7 +277,7 @@ try {
 
 | Feature | Model | Why |
 |---------|-------|-----|
-| Free summary | `agnes-2.0-flash` | Already paid for. Keeps the Anthropic credit for paying customers |
+| Free summary | `agnes-3.0-flash` | Already paid for. Keeps the Anthropic credit for paying customers |
 | Fallback | `kimi-k2.6` (moonshot) | Backup when Agnes is rate-limited |
 | Paid report | `claude-haiku-4-5` | 200K context reads a whole policy wording; ~6 cents per report |
 
@@ -287,6 +293,7 @@ try {
 | `lib/json-response.js` | Tolerant JSON parsing, including repair of truncated responses |
 | `lib/tiers.js` | Free vs paid-report definitions, including the price |
 | `lib/store.js` | Shared state over Upstash REST — rate limits and payment redemption |
+| `lib/providers.js` | Free-tier provider config. **Model ids live here, from env vars** |
 | `pages/api/analyze.js` | Quick summary endpoint |
 | `pages/api/analyze-fallback.js` | Executive endpoint with provider fallback |
 | `pages/api/analyze-compare.js` | Retired stub (402) |
@@ -414,3 +421,32 @@ has already paid and must be able to try again.
 - **No Stripe webhook.** Payment is verified by retrieving the session on
   demand, which is sufficient for one-off purchases and needs no endpoint
   secret. Add a webhook only if you move to subscriptions.
+
+
+---
+
+## Changing The Free-Tier Model
+
+Agnes has retired a model three times (1.5-pro, 1.5-flash, 2.0-flash), and each
+time it meant editing source and redeploying. It does not any more.
+
+`lib/providers.js` reads `AGNES_MODEL` and `AGNES_BASE_URL` from the
+environment, defaulting to `agnes-3.0-flash`. To move to the next model, change
+the Vercel environment variable and redeploy — no code change, and nothing to
+get wrong in two files.
+
+Current model, as of 2026-09-27: **`agnes-3.0-flash`**. OpenAI-compatible at
+`https://apihub.agnes-ai.com/v1/chat/completions`, very large context, and much
+cheaper than the model it replaces (roughly $0.05 per million input tokens and
+$0.15 per million output, against Haiku's $1 / $5).
+
+### The free context budget is now the cheap part
+
+At those rates a free summary at the current 30,000-character budget costs well
+under a tenth of a cent. `ANALYZE_CONTEXT_CHARS` could be raised a long way
+before cost mattered.
+
+It is deliberately left at 30,000 anyway, because it is a **pricing** decision
+rather than a cost one: "the report reads the whole wording, the free summary
+reads the opening pages" is the paid tier's main pitch. Raise it only if you
+decide the free tier should be more generous.

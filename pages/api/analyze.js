@@ -3,6 +3,7 @@ import { condensePolicyText } from '../../lib/policy-text';
 import { parseModelJson } from '../../lib/json-response';
 import { FREE } from '../../lib/tiers';
 import { rateLimit, clientKey, isShared } from '../../lib/store';
+import { getProvider } from '../../lib/providers';
 
 // Vercel Pro allows 60s; the client aborts at 55s.
 export const config = { maxDuration: 60 };
@@ -32,7 +33,8 @@ export default async function handler(req, res) {
       return res.status(413).json({ error: 'Document is too large to analyse. Please upload a shorter extract.' });
     }
 
-    const API_KEY = process.env.AGNES_API_KEY || '';
+    const agnes = getProvider('agnes');
+    const API_KEY = agnes.apiKey();
     if (!API_KEY) {
       return res.status(500).json({ error: 'AI service not configured' });
     }
@@ -54,14 +56,14 @@ export default async function handler(req, res) {
     const systemPrompt = standardPrompt();
     const condensed = condensePolicyText(text, CONTEXT_BUDGET);
 
-    const response = await fetch('https://apihub.agnes-ai.com/v1/chat/completions', {
+    const response = await fetch(`${agnes.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${API_KEY}`
       },
       body: JSON.stringify({
-        model: 'agnes-2.0-flash',
+        model: agnes.model,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: buildUserMessage(condensed.text, { ...condensed, fileName }) }
@@ -95,7 +97,7 @@ export default async function handler(req, res) {
       mode,
       meta: {
         provider: 'agnes',
-        model: 'agnes-2.0-flash',
+        model: agnes.model,
         truncated: condensed.truncated,
         chars_analysed: condensed.text.length,
         chars_supplied: condensed.originalChars,

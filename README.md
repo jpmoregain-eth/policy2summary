@@ -23,7 +23,7 @@ No signup. No data stored.
 
 - **Frontend:** Next.js + Tailwind CSS
 - **PDF Parsing:** pdfjs-dist (client-side)
-- **AI Analysis:** Agnes AI API, with Kimi fallback and an optional Claude Haiku 4.5 route
+- **AI Analysis:** Agnes AI (`agnes-3.0-flash`) for free summaries, Claude Haiku 4.5 for paid reports, Kimi as fallback
 - **Privacy:** Documents are not stored by this app. Extracted text is sent to a third-party AI provider for analysis and is not retained here.
 
 ## Local Development
@@ -32,6 +32,7 @@ No signup. No data stored.
 npm install
 cat > .env.local <<'ENV'
 AGNES_API_KEY=your_key_here          # free-tier summaries
+# AGNES_MODEL=agnes-3.0-flash        # optional — override without a code change
 # Paid reports:
 # ANTHROPIC_API_KEY=your_key_here    # Claude Haiku 4.5
 # STRIPE_SECRET_KEY=sk_test_...      # Stripe Checkout
